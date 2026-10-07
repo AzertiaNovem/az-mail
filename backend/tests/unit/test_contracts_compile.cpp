@@ -568,21 +568,6 @@ TEST_CASE("jobs::enqueue / cancel / reschedule (implemented in WP0 for WP-B)", "
                   std::invalid_argument);
 }
 
-TEST_CASE("WP0 stubs throw NotImplemented", "[contracts][stubs]") {
-  test::TempDir td;
-  db::Pool pool(td / "st.db", 1);
-  pool.read([](db::Conn& c) {
-    CHECK_THROWS_AS(mail::list_threads(c, 1, mail::ThreadQuery{}), NotImplemented);
-    CHECK_THROWS_AS(repo::find_session(c, "tok", 0), NotImplemented);
-  });
-  CHECK_THROWS_AS(mail::compile_search("from:a", 480, 0), NotImplemented);
-  CHECK_THROWS_AS(storage::sigv4::amz_date(0), NotImplemented);
-  CHECK_THROWS_AS(resend::verify_svix("whsec_x", "id", "1", "v1,x", "{}", 1), NotImplemented);
-  http::Router router;
-  CHECK_THROWS_AS(api::register_routes(router), NotImplemented);
-  CHECK_THROWS_AS(mail::eml::parse_headers("Subject: x\r\n\r\n"), NotImplemented);
-}
-
 TEST_CASE("jobs: EnqueueOpts::now_ms and extend_lease (WP0)", "[contracts][jobs]") {
   test::TempDir td;
   db::Pool pool(td / "lease.db", 1);
@@ -691,14 +676,3 @@ TEST_CASE("test_support seeding helpers and TestServices", "[contracts][test_sup
   CHECK(ts.db.read([&](db::Conn& c) { return test::address_id(c, "support@team.example"); }) == support);
 }
 
-TEST_CASE("WP0 fixer stubs link", "[contracts][stubs]") {
-  test::TestServices ts;
-  ts.db.write([&](db::Tx& tx) {
-    CHECK_THROWS_AS(mail::queue_send(tx, ts.cfg, ts.urls, 1, 1, mail::SendOptions{}), NotImplemented);
-    CHECK_THROWS_AS(mail::queue_send(tx, ts.cfg, 1, 1, mail::SendOptions{}), NotImplemented);
-  });
-  ts.db.read([&](db::Conn& c) {
-    CHECK_THROWS_AS(mail::is_blob_unreferenced(c, std::string(64, 'a')), NotImplemented);
-  });
-  CHECK_THROWS_AS(mail::strip_api_file_urls("<img src=x>", "http://127.0.0.1:8080"), NotImplemented);
-}
