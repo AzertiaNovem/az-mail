@@ -58,11 +58,16 @@ int64_t merge_threads(db::Tx& tx, int64_t owner, int64_t keep, int64_t absorb);
 // Does not emit (callers emit threads.changed / mail.new).
 bool recompute_thread(db::Tx& tx, int64_t owner, int64_t thread_id);
 
-// Lowercased, whitespace-collapsed subject with all leading reply/forward prefixes and list
-// tags like "[team]" removed, e.g. "Re: 回复：[ops] 周报" → "周报".
+// Lowercased (ASCII), whitespace-collapsed subject with every leading reply/forward prefix
+// removed. Leading list tags like "[team]" are KEPT (they tell "[team-a] 周报" from
+// "[team-b] 周报"); prefixes interleaved with them are still removed, e.g.
+// "Re: 回复：[ops] 周报" → "[ops] 周报", "[ops] Re: 周报" → "[ops] 周报".
+// (WP-B1: the WP0 draft of this comment said tags were removed; the work-package brief
+// requires them kept.)
 std::string normalize_subject(std::string_view subject);
 
-// True when the subject starts with a reply/forward prefix (C7).
+// True when the subject starts with a reply/forward prefix (C7), also after leading list tags
+// ("[ops] Re: x").
 bool has_reply_prefix(std::string_view subject);
 
 // Thread ids of `owner` that contain a message with one of these Message-IDs (via

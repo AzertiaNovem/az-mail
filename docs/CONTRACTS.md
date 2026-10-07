@@ -455,3 +455,58 @@ Smallest additive decisions where DESIGN.md was silent or contradictory (DESIGN.
 already type-check; the `POST /api/admin/outbox/:id/retry` comments in `types.ts` and
 `api/admin.ts` should say "returns the NEW OutboxRow (new id and uuid)", and WP-F should invalidate
 `['admin','outbox']`; `DomainDnsRecord.priority?: number` stays as is (backend omits it).
+
+---
+
+## I. WP-B1 decisions (mail domain, read side)
+
+Additive notes where DESIGN/headers left room; WP-B2 continues from this branch.
+
+1. **New internal files** (not contracts): `mail/internal.{hpp,cpp}` (address-list JSON columns
+   `[{name,email}]`, LIKE escaping, `json_each` id lists, owner address set, MIME normalization)
+   and `mail/html_scan.{hpp,cpp}` (forgiving HTML tokenizer with attribute spans + entity
+   decoding, shared by `html_text` and `render`). WP-B2 writes `messages.*_json` with
+   `detail::addresses_to_json`. Test fixtures for mail rows: `tests/unit/mail_fixtures.hpp`.
+2. **`normalize_subject` keeps leading list tags** (`"[team] 周报"`), removing reply/forward
+   prefixes around them (`"Re: [ops] Re: 周报"` → `"[ops] 周报"`), per the WP-B1 brief; the WP0
+   header comment said tags were removed and was updated. ASCII lowercase, whitespace collapsed.
+   `has_reply_prefix` also looks past leading tags.
+3. **Threading**: `assign_thread` looks up the message's own id together with its refs, so a reply
+   that arrived first is found directly (merge into the lowest thread id when several match);
+   `adopt_referencing` covers ids learned later. Subject fallback participants exclude the owner's
+   own addresses (mailbox + aliases), otherwise every thread would "overlap"; candidates need
+   `|last_at − date| ≤ 7 d` (threads with only trash/spam have `last_at = 0` and never match).
+4. **Message sets**: spam = `is_spam=1 AND trashed_at IS NULL`, trash = `trashed_at IS NOT NULL`
+   (disjoint). `recompute_thread`: drafts never count as unread; snippet/last_message_id fall back
+   to the latest draft, then the latest message of any set, so drafts-only / spam / trash threads
+   still show text; participants are senders of non-draft messages (drafts' author when there are
+   only drafts), first + 5 most recently active when > 6; `attachment_count` = non-inline
+   attachments of non-draft messages; `subject` = earliest non-draft message with a subject.
+5. **Thread list**: keyset cursor = base64url(`"<sort_key>:<thread_id>"`); folder queries spell
+   the partial-index predicates verbatim (asserted with EXPLAIN QUERY PLAN). Per-view scope:
+   spam/trash views use `spam_last_at` / `trash_last_at`, spam/trash unread and labels/previews of
+   that set; other views the normal set. Search orders threads by the latest *matching* message
+   date (also returned as `last_at`); `in:spam`/`in:trash`/`in:anywhere` switch the scope.
+   `latest_status` = status of the latest non-draft message with an outbound row in the view;
+   `scheduled_at` = earliest `scheduled_at` with the `scheduled_count` status rule.
+6. **Thread actions**: `inbox` = move to inbox (clears spam + trash, `in_inbox=1` on received
+   non-draft messages, or on sent ones when the thread has none received); `read`/`unread`/`spam`
+   skip drafts; `star` stars the latest normal non-draft message; `unstar` and `remove_label`
+   apply to all messages; `add_label` to normal messages; `delete_forever` deletes only trashed or
+   spam messages. Each affected thread is recomputed; one `threads.changed` per call.
+7. **Search**: invalid operator values (`in:foo`, `after:yesterday`) fall back to literal text;
+   `cc:` / `bcc:` match `messages.cc_json` / `bcc_json` via `json_each` (`to:` = FTS `to_text`,
+   i.e. to + cc (+ own bcc)); `label:a-b` also matches the label "a b"; `has:attachments` is
+   accepted; `larger:` is `>=`, `smaller:` is `<`; `before:` is exclusive of that local day.
+   Short-term LIKE runs on the message's own FTS row (`f.rowid = m.id`) so the scan stays within
+   the owner's candidate messages.
+8. **`html_to_text` link format** follows the frozen header: `text <url>` (the brief said
+   `text (url)`); links whose text equals the URL / mailto address, image-only links and `#`,
+   `javascript:`, `cid:`, `data:` targets add nothing. `make_snippet` keeps the header default of
+   200 code points and falls back to the quoted text when the body is only a quote.
+9. **`purge_trash`**: a negative day count disables that half, 0 purges immediately.
+10. **`attachments.hpp` gained `thread_attachments(conn, owner, thread_id)`** (additive).
+11. **WP0 stub tests**: `test_contracts_compile.cpp` "WP0 stubs throw NotImplemented" (lines with
+   `mail::list_threads`, `mail::compile_search`) and "WP0 fixer stubs link"
+   (`mail::is_blob_unreferenced`, `mail::strip_api_file_urls`) assert that WP-B functions are
+   still stubs and fail once they are implemented; WP0 (the owner) must drop those assertions.
