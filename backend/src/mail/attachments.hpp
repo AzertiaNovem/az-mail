@@ -38,6 +38,9 @@ std::optional<AttachmentRecord> find_attachment(db::Conn& c, int64_t owner, int6
 // Attachments of one owned message, by id.
 std::vector<AttachmentRecord> message_attachments(db::Conn& c, int64_t owner, int64_t message_id);
 
+// (WP-B1, additive) Attachments of every message of one owned thread, by message id then id.
+std::vector<AttachmentRecord> thread_attachments(db::Conn& c, int64_t owner, int64_t thread_id);
+
 // Raw .eml of an owned INBOUND message (inbound_emails.raw_sha256). nullopt for outbound
 // messages, messages without a raw blob, or foreign ids.
 std::optional<RawRef> find_raw(db::Conn& c, int64_t owner, int64_t message_id);
