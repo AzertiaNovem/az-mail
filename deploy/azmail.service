@@ -1,0 +1,61 @@
+# AZ Mail backend — systemd unit (docs/DEPLOY.md).
+# Install: cp deploy/azmail.service /etc/systemd/system/ && systemctl daemon-reload
+#          systemctl enable --now azmail
+# Logs:    journalctl -u azmail -f
+
+[Unit]
+Description=AZ Mail backend (team webmail over Resend)
+Documentation=https://resend.com/docs
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=azmail
+Group=azmail
+EnvironmentFile=/etc/azmail/azmail.env
+ExecStart=/usr/local/bin/azmail serve
+WorkingDirectory=/var/lib/azmail
+Restart=on-failure
+RestartSec=3
+# Graceful shutdown: acceptor closed, WebSockets get going_away, job runners get 25 s
+# (AZMAIL_SHUTDOWN_GRACE_SEC) — then systemd kills after 30 s.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=65536
+SyslogIdentifier=azmail
+UMask=0027
+
+# The only writable place: database (local disk, never NFS), blobs, tmp, proxy cache.
+StateDirectory=azmail
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/azmail
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
