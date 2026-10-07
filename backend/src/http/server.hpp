@@ -9,6 +9,7 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/thread_pool.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -36,6 +37,9 @@ struct ServerDeps {
   // Exec::Files handlers (R2/disk file I/O, cfg.files_threads). A pointer so existing aggregate
   // initializers stay valid; App always sets it; nullptr → Exec::Files runs on net_pool.
   boost::asio::thread_pool* files_pool = nullptr;
+  // Additive (WP-A): WebSocket re-authentication period (ws::WsDeps::reauth_interval, DESIGN
+  // step 5b of ws_session.hpp); tests shorten it.
+  std::chrono::milliseconds ws_reauth_interval{std::chrono::minutes(5)};
 };
 
 class Server {

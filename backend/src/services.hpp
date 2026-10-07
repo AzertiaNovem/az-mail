@@ -38,6 +38,7 @@ class Runner;
 }
 namespace http {
 class LoginThrottle;
+struct SessionResolver;
 }
 
 struct Services {
@@ -61,6 +62,9 @@ struct Services {
   boost::asio::thread_pool* db_workers = nullptr;   // blocking pool "db"  (Exec::Db)
   boost::asio::thread_pool* net_workers = nullptr;  // blocking pool "net" (Exec::Net)
   boost::asio::thread_pool* files_workers = nullptr;  // blocking pool "files" (Exec::Files)
+  // Additive (WP-A): replaces the repo-backed Bearer-token lookup in http::authenticate when
+  // set (unit tests of the HTTP/WS runtime; null in production → repo::find_session).
+  http::SessionResolver* session_resolver = nullptr;
 
   int64_t now_ms() const { return clock.now_ms(); }
 
