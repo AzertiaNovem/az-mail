@@ -1,0 +1,17 @@
+From: "Li Si" <lisi@example.org>
+To: alice@team.example
+Subject: Re: Re: project
+	 plan
+Date: Wed, 08 Oct 2026 09:15:42 -0000
+Message-ID:
+ <reply-3@example.org>
+In-Reply-To: <msg-2@team.example> (Alice's message of Tue)
+References: <root-1@example.org>
+	<msg-1@team.example>
+   <msg-2@team.example>
+X-AzMail-Ref:   6f1c2c1e-3b8a-4c55-9a51-0d6c9d2a7b10  
+Auto-Submitted: Auto-Replied; owner-email="lisi@example.org"
+Reply-To: "Li Si (work)" <lisi+work@example.org>, other@example.org
+
+Hello
+Subject: not a header

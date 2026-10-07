@@ -1,0 +1,8 @@
+From: =?big5?B?s6+kaqTl?= <chen@example.tw>
+To: carol@team.example
+Subject: Re: =?UTF-8?B?5Lit5g==?= =?UTF-8?B?loc=?= and =?ISO-8859-1?Q?caf=E9?= =?Shift_JIS?B?k/qWe4zq?=
+X-Unknown-Charset: =?x-unknown?Q?abc?= tail
+X-Broken: =?utf-8?B?not base64!?= =?utf-8?Q?ok?=
+Date: Thu, 9 Oct 2026 01:02:03 +0900 (JST)
+Message-ID: <mixed-1@example.tw>
+

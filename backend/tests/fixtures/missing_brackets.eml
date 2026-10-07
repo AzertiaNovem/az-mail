@@ -1,0 +1,9 @@
+From: dave@example.net
+Subject: ids
+Message-ID: abc123@host.example.net
+In-Reply-To: parent@host.example.net
+References: <a@x.example> b@y.example (a comment <not@an.id>) <c@z.example>
+ <a@x.example> "quoted <q@q.example>" noise
+References: <d@w.example>
+Date: garbage date
+

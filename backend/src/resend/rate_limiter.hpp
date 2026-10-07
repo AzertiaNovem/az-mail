@@ -15,10 +15,15 @@
 #include "core/time.hpp"
 #include "resend/types.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <stop_token>
 #include <utility>
+
+namespace azm {
+struct Config;
+}
 
 namespace azm::resend {
 
@@ -50,7 +55,7 @@ class RateLimiter {
   struct Options {
     double rps = 8.0;         // tokens per second (> 0)
     double burst = 8.0;       // bucket capacity (≥ 1)
-    double low_reserve = 2.0;  // Low priority needs more than this many tokens
+    double low_reserve = 2.0;  // Low priority waits while fewer than this many tokens remain
   };
 
   explicit RateLimiter(Options opts, const Clock& clock = system_clock());
@@ -64,6 +69,9 @@ class RateLimiter {
   bool try_acquire(Priority p);
   // Pause every priority until `until_ms` (ms epoch). A later pause extends, an earlier one is ignored.
   void pause_until(int64_t until_ms);
+  // Additive (WP-C): pause_until(clock.now_ms() + d) using the limiter's own clock (callers such
+  // as resend::Client have no Clock of their own).
+  void pause_for(std::chrono::milliseconds d);
   int64_t paused_until() const;  // 0 when not paused
   double available() const;      // current token count (after refill), for tests/metrics
 
@@ -71,5 +79,9 @@ class RateLimiter {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// Additive (WP-C): Options from Config — rps = cfg.resend_rate_rps (default 8; Resend's limit
+// is 10/s per team), burst = rps (at least 1), low_reserve = 2.
+RateLimiter::Options rate_limiter_options_from(const Config& cfg);
 
 }  // namespace azm::resend

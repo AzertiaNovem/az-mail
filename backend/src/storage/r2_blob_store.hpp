@@ -50,6 +50,11 @@ struct R2Options {
   std::filesystem::path cache_dir;                // <cfg.data_dir>/cache (proxy mode)
   std::uint64_t cache_max_bytes = 1024ull << 20;  // cfg.file_cache_mb MiB
   std::chrono::milliseconds request_timeout{120000};  // per object request (50 MB at ~0.5 MB/s)
+  // Additive (WP-C): in-store retry policy for retryable failures (429 / 5xx / network): up to
+  // `max_attempts` tries per operation, sleeping retry_base_delay × 2^(n-1) between them (a 429
+  // on PUT is followed by a re-HEAD: an object stored meanwhile counts as success).
+  int max_attempts = 4;
+  std::chrono::milliseconds retry_base_delay{250};
 };
 
 // Options from Config. Throws std::invalid_argument when bucket, endpoint or credentials are
