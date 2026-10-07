@@ -1,6 +1,86 @@
 /*
- * Mail UI styles [WP-E]. Import it from the mail package's root component (AppShell).
+ * Mail UI styles [WP-E]. Imported by AppShell (the mail package's root component).
  * `@reference` makes the theme tokens and utilities from index.css available to `@apply`
  * without emitting index.css a second time (Tailwind v4).
  */
 @reference "./index.css";
+
+/* Loading skeleton shimmer. */
+.azm-shimmer {
+  display: inline-block;
+  background: linear-gradient(90deg, #eef1f6 0%, #f6f8fb 40%, #eef1f6 80%);
+  background-size: 200% 100%;
+  animation: azm-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes azm-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .azm-shimmer {
+    animation: none;
+  }
+}
+
+/* Email body frame: always a light canvas, whatever surrounds it (DESIGN §5 step 9). */
+.azm-email-frame {
+  @apply min-w-0 max-w-full;
+  color-scheme: light;
+}
+
+/* Gmail's "•••" quoted-text toggle. */
+.azm-quote-toggle {
+  @apply inline-flex h-3 w-6 items-center justify-center overflow-hidden rounded-sm bg-surface-container-highest text-on-surface-variant transition-colors;
+}
+.azm-quote-toggle:hover {
+  @apply bg-outline-variant text-on-surface;
+}
+.azm-quote-toggle .material-symbols-outlined {
+  font-size: 18px !important;
+}
+
+/* Plain-text bodies read like Gmail's (system font, comfortable line height). */
+.azm-plain-text {
+  @apply text-sm leading-6 text-on-surface;
+  overflow-wrap: anywhere;
+}
+
+/* "显示 N 封较早的邮件": a divider with a centered counter. */
+.azm-older-messages {
+  @apply relative bg-surface-container;
+}
+.azm-older-messages::before {
+  content: "";
+  @apply pointer-events-none absolute inset-x-0 top-1/2 border-t border-divider;
+}
+.azm-older-messages > * {
+  @apply relative;
+}
+.azm-older-messages > span:last-child {
+  @apply bg-surface-container pr-2;
+}
+
+/* Toolbars scroll sideways on narrow screens instead of overflowing; no visible scrollbar. */
+.azm-toolbar {
+  scrollbar-width: none;
+}
+.azm-toolbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Thin scrollbars inside the main card. */
+.azm-shell main ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.azm-shell main ::-webkit-scrollbar-thumb {
+  background-color: rgb(0 0 0 / 0.2);
+  border-radius: 4px;
+}
+.azm-shell main ::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(0 0 0 / 0.35);
+}
