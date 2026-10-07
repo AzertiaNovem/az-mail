@@ -1,0 +1,3 @@
+# Owner: WP-C — header fixtures are byte-exact (CRLF vs LF line endings, raw 8-bit GBK bytes):
+# never let Git normalize them.
+*.eml -text
