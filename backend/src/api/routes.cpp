@@ -1,6 +1,7 @@
 // Owner: WP-D
-// The route table is written in WP0 as part of the contract (docs/CONTRACTS.md §B); handlers
-// are stubs until WP-D implements them. register_routes depends on WP-A's Router::add.
+// The route table is written in WP0 as part of the contract (docs/CONTRACTS.md §B); the
+// handlers live in api/*.cpp. register_routes binds every route_table() entry through WP-A's
+// Router::add (which rejects duplicates and malformed patterns).
 #include "api/routes.hpp"
 
 #include "api/handlers.hpp"
