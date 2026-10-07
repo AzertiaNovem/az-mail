@@ -64,7 +64,8 @@ bool mark_sending(db::Tx& tx, int64_t outbound_id);
 void mark_accepted(db::Tx& tx, int64_t outbound_id, std::string_view resend_id, bool scheduled);
 
 // Terminal failure: status 'failed', error_name = `name` (Resend error name), status_detail =
-// `detail_zh` (e.g. "发送配额已用完"), event local.failed.
+// `detail_zh` (e.g. "发送配额已用完"), event local.failed. (WP-B2) No-op when canceled, or when
+// Resend already reported the mail as sent or later (a webhook outran a failing POST retry).
 void mark_failed(db::Tx& tx, int64_t outbound_id, std::string_view name, std::string_view detail_zh);
 
 // Transient failure while retrying: keeps status 'sending', sets status_detail (e.g.

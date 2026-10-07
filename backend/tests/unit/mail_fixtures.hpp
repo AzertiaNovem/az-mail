@@ -1,9 +1,9 @@
 // Owner: WP-B — test fixtures for the mail domain (raw-SQL seeding of mail rows).
 //
-// WP-B2's deliver_inbound / create_draft / queue_send do not exist yet in WP-B1, so tests insert
-// messages the way those functions will: message row (+ body, refs, attachments, labels), with
-// the thread chosen by mail::assign_thread, then adopt_referencing, recompute_thread and
-// fts_reindex — i.e. the same sequence DESIGN §3 "deliver_inbound" prescribes.
+// Read-side tests insert messages directly, the way deliver_inbound / queue_send do: message row
+// (+ body, refs, attachments, labels), with the thread chosen by mail::assign_thread, then
+// adopt_referencing, recompute_thread and fts_reindex — the sequence DESIGN §3 "deliver_inbound"
+// prescribes. Write-side tests (WP-B2) use the real functions via send_fixtures.hpp.
 #pragma once
 
 #include "core/address.hpp"

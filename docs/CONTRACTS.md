@@ -510,3 +510,83 @@ Additive notes where DESIGN/headers left room; WP-B2 continues from this branch.
    `mail::list_threads`, `mail::compile_search`) and "WP0 fixer stubs link"
    (`mail::is_blob_unreferenced`, `mail::strip_api_file_urls`) assert that WP-B functions are
    still stubs and fail once they are implemented; WP0 (the owner) must drop those assertions.
+
+---
+
+## J. WP-B2 decisions (mail domain, write side)
+
+Additive notes for drafts, outbound and inbound where DESIGN/headers left room.
+
+1. **New internal files** (not contracts): `mail/send_internal.{hpp,cpp}` — the frozen payload
+   format, delivery-event bookkeeping, status fan-out to every copy, shared-copy removal, the
+   "back to draft" transition, the send-job enqueue. Test fixtures: `tests/unit/send_fixtures.hpp`.
+2. **Drafts are `direction='out', is_draft=1`**, `is_read=1`, `in_inbox=0`; `date`/`updated_at`
+   move on every save (so the thread's `last_at` follows the latest edit, §2). Subjects are stored
+   with CR/LF/TAB replaced by spaces.
+3. **`outbound.payload_json`** (internal, read only by `load_send_plan`): formatted from/to/cc/bcc,
+   subject, frozen html/text, `attachment_ids`, `parent_message_id`, the parent Message-ID known at
+   freeze (`in_reply_to`), the parent's References chain without the parent id (`references`) and
+   the pre-freeze draft body (`draft.html`, `draft.quoted_html`) that undo / cancel restore. The
+   parent id is re-resolved at load time (frozen → parent message row → parent outbound row), and
+   a reply to our own sent mail reuses that mail's resolved chain. Inbound References are kept in
+   order in `inbound_emails.meta_json.references` (message_refs is an unordered set); meta_json
+   holds header metadata only, never bodies.
+4. **Freeze**: `<div style="font…">body + <div class="azm-signature">signature</div> +
+   <div class="gmail_quote azm-quote">quoted_html</div></div>`, then `strip_att_ids` and
+   `strip_api_file_urls`. The signature is skipped when disabled/empty or when the body's text
+   already contains the signature's text (the editor inserted it); image-only signatures are
+   always appended. `gmail_quote` keeps the quote out of snippets. In-Reply-To/References are set
+   for reply, reply_all **and forward** (Gmail-like threading); recipients are de-duplicated
+   across To → Cc → Bcc (case-insensitive) in the payload and the stored copy.
+5. **Recipient validation**: `unknown_local_recipients` also lists local addresses that cannot
+   receive (disabled user, alias without active members), since that mail would be silently lost
+   (C4). `no_recipients` is checked before `too_many_recipients` and the local-recipient check;
+   `message_too_large` details: `{attachment_id, limit}` or `{total_bytes, limit}`.
+6. **Attachments on drafts**: `attachment_ids` is the full list on update, but inline attachments
+   still referenced by html/quoted_html (by id, `cid:`, or through the parent attachment a quote
+   URL names) are kept; on create the list only adds uploads (the copied quote images are new to
+   the client). Owner's unattached **inline** uploads referenced by `data-att-id` / file URL in the
+   client HTML are attached automatically (E3 paste flow). Copied parent attachments: Content-ID
+   set and (inline or referenced by the parent's HTML) → copied as inline; forward +
+   `include_parent_attachments` copies everything as is.
+7. **Reply defaults** when a create request omits them: subject `Re: …` / `Fwd: …` (kept when
+   already prefixed); reply → `reply_to` or `from` (to our own sent mail: its To); reply_all →
+   that + To, Cc = parent Cc, minus the owner's own addresses (falls back to From when nothing is
+   left); forward → no recipients. From defaults (reply/reply_all only) to the parent's
+   `delivered_to` or, for our own sent parent, its `from_address_id` when the owner may send as
+   it. A reply mode without `parent_message_id` → 400 `invalid_field`; drafts are not parents (404).
+8. **Undo / cancel → draft**: `outbound_id`, Message-ID, `in_reply_to` and message_refs are
+   cleared on the restored draft (version + 1, un-trashed); the canceled outbound row stays as
+   history. Undo of a draft → 409 `too_late`; of a shared copy, an inbound message or someone
+   else's message → 404. `finish_cancel_schedule` on an already canceled outbound → 409
+   `invalid_state`.
+9. **Status**: every transition records a `local.*` event (`local.queued`, `local.sending`,
+   `local.accepted`, `local.failed`, `local.canceled`, `local.schedule_local`,
+   `local.rescheduled`; source keys `local:<n>`); `outbound.status` is emitted to every copy owner
+   on each status change, `threads.changed` too when the Sent/Scheduled membership changes.
+   `last_event` stores Resend's spelling (`delivered`, `opened`, …; local types verbatim) and never
+   regresses on out-of-order events; `status_detail` comes from `bounce.message`,
+   `failed.reason`, `suppressed.message|reason`, `reason`, `message`, `error` (≤ 1000 bytes) and
+   is cleared by a status change without text. `mark_failed` is a no-op once Resend reported
+   `sent` or later (a webhook outran a failing POST retry); `mark_accepted(scheduled=true)` for a
+   send without `scheduled_at` is a plain acceptance. `accepted_at` is the first acceptance (also
+   for Resend-scheduled sends, per the header).
+10. **Retry** (`retry_failed_send`, `admin_retry_outbound`): a scheduled send keeps its time (and
+    `scheduled_via`) when it is still ≥ 60 s ahead, otherwise it sends now.
+11. **Loopback / spoofing**: an `X-AzMail-Ref` or Message-ID only identifies our own outbound when
+    the From address equals that outbound's identity (both values are visible to recipients, so
+    alone they could suppress or "un-spam" forged mail). A merge sets `in_inbox=1`, keeps the
+    sender's copy read and marks a member's shared copy unread, and emits `mail.new` to non-senders.
+    Late cleanup in `set_outbound_message_id` ORs `in_inbox` only from a normal (not spam/trash)
+    loopback copy, re-points drafts whose parent was that copy, and merges the loopback copy's
+    thread into the out copy's thread.
+12. **Delivery**: `received_for` entries in `Name <addr>` form are accepted; a `Date` more than 24 h
+    after `received_at` is replaced by `received_at`; an attachment is inline when it has a
+    Content-ID and either an inline disposition or a `cid:` reference in the HTML; spam copies do
+    not add contacts; the unroutable-to-admins policy applies only when an envelope recipient is
+    in a local domain (`delivered_to` = the first such address). An email whose copies were all
+    skipped as split-delivery duplicates is marked `delivered` and returns `Duplicate`.
+13. **`mark_inbound_failed`** never downgrades a `delivered` email; for an unknown resend id it
+    creates the row (source `webhook`); `error` is truncated to 500 bytes.
+14. **WP0 stub tests** (see §I 11): "WP0 fixer stubs link" also asserts `mail::queue_send` throws
+    `NotImplemented` (lines 697–698), which no longer holds; WP0 must drop those assertions too.
