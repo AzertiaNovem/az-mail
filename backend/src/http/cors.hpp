@@ -22,13 +22,19 @@ namespace azm::http {
 struct CorsPolicy {
   std::vector<std::string> allowed_origins;  // e.g. "https://mail.example.com" (scheme://host[:port])
   std::string allow_methods = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
-  std::string allow_headers = "Authorization, Content-Type";
+  std::string allow_headers = "Authorization, Content-Type, Idempotency-Key";
   std::string expose_headers = "X-Request-Id, Retry-After, Content-Disposition";
   int max_age_sec = 600;  // Access-Control-Max-Age for preflights
 };
 
-// Policy from cfg.cors_origins (entries trimmed, trailing '/' removed).
+// Policy from cfg.cors_origins (entries trimmed, trailing '/' removed; invalid entries — not
+// "http(s)://host[:port]" — are skipped, validate_config reports them).
 CorsPolicy cors_policy_from(const Config& cfg);
+
+// ---- additive helpers (WP-A) ------------------------------------------------------------------
+// Canonical "scheme://host[:port]" (scheme and host lowercased, IPv6 hosts bracketed) for a
+// serialized origin, or nullopt when it is not an http/https origin without path/query/userinfo.
+std::optional<std::string> normalize_origin(std::string_view origin);
 
 // True when `origin` exactly matches an allowed origin (scheme and host compared
 // case-insensitively, port exactly). "null" and empty origins are never allowed.
@@ -36,6 +42,7 @@ bool origin_allowed(const CorsPolicy&, std::string_view origin);
 
 // Adds "Vary: Origin" always and, when `origin` is allowed, Access-Control-Allow-Origin
 // (echoing the origin) and Access-Control-Expose-Headers. Disallowed origins get no ACAO.
+// Headers the response already carries are not duplicated (an existing Vary gains ", Origin").
 void apply_cors(const CorsPolicy&, std::optional<std::string_view> origin, Response& res);
 
 // Response to an OPTIONS preflight: 204 with Allow-Origin/Methods/Headers/Max-Age when the

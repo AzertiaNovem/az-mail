@@ -20,6 +20,8 @@ namespace azm::http {
 //  1. Sets the thread's log request id (log::ScopedRequestId(req.request_id)).
 //  2. Auth per route.auth:
 //       None / Signed / Webhook → Ctx::principal unset (the handler verifies signatures);
+//       Signed additionally gets an HMAC pre-check here for the /api/files/:id (u, d, exp, sig)
+//       and /api/files/raw/:messageId (u, exp, sig) shapes → 403 "invalid_signature";
 //       User / Admin → bearer_token() + authenticate(); missing or invalid → 401 "unauthorized";
 //       Admin with !is_admin → 403 "forbidden".
 //  3. Calls route.handler with Ctx{req, svc, params, principal}.
@@ -37,6 +39,16 @@ std::optional<std::string> bearer_token(const Request& req);
 // the session's last_seen_at is older than cfg.session_touch_interval_sec it is touched
 // (sliding expiry, cfg.session_ttl_days) in a separate short Pool::write. nullopt for unknown,
 // expired or disabled. Also used by ws::run_ws_session for first-message auth.
+// When Services::session_resolver is set, the lookup is delegated to it instead (tests and
+// alternative backends); empty or oversized (> 512 bytes) tokens are rejected before either.
 std::optional<Principal> authenticate(Services& svc, std::string_view token);
+
+// ---- additive (WP-A) ------------------------------------------------------------------------
+// Injectable session lookup (Services::session_resolver). Called on a blocking pool thread with
+// the raw bearer token; returns the principal or nullopt. Must be thread-safe.
+struct SessionResolver {
+  virtual ~SessionResolver() = default;
+  virtual std::optional<Principal> resolve(Services& svc, std::string_view raw_token) = 0;
+};
 
 }  // namespace azm::http

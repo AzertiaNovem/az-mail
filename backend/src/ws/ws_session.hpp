@@ -24,6 +24,8 @@
 #include <boost/beast/http/empty_body.hpp>
 #include <boost/beast/http/message.hpp>
 
+#include <chrono>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -42,7 +44,14 @@ struct WsDeps {
   Hub& hub;
   boost::asio::thread_pool& db_pool;  // session-token lookup runs here, never on the strand
   const http::CorsPolicy& cors;       // Origin allowlist
+  // Additive (WP-A): period of the step-5b re-authentication (tests shorten it).
+  std::chrono::milliseconds reauth_interval{std::chrono::minutes(5)};
 };
+
+// Close codes besides kCloseAuthFailed (events.hpp) used by the session.
+inline constexpr std::uint16_t kCloseGoingAway = 1001;  // server shutdown
+inline constexpr std::uint16_t kClosePolicy = 1008;     // send-queue overflow, too many sessions
+inline constexpr std::uint16_t kCloseInternal = 1011;   // unexpected server error
 
 // Takes over a connection whose upgrade request header was already read by http::run_session.
 // Returns when the WebSocket (or the rejected handshake) is finished. Never throws.

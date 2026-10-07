@@ -1,13 +1,6 @@
-// Placeholder entry point (WP0). WP-A replaces this with the CLI dispatcher
-// (serve|migrate|create-user|reset-password|add-domain|backup|reindex|doctor|blobs-migrate).
-#include <cstdio>
-#include <cstring>
+// Owner: WP-A
+// azmail entry point: everything is in app::run_cli (serve | migrate | create-user |
+// reset-password | add-domain | backup | reindex | doctor | blobs-migrate | version).
+#include "app/cli.hpp"
 
-int main(int argc, char** argv) {
-  if (argc > 1 && (std::strcmp(argv[1], "--version") == 0 || std::strcmp(argv[1], "version") == 0)) {
-    std::printf("azmail %s\n", AZMAIL_VERSION);
-    return 0;
-  }
-  std::printf("azmail %s (placeholder build; commands are provided by WP-A)\n", AZMAIL_VERSION);
-  return 0;
-}
+int main(int argc, char** argv) { return azm::app::run_cli(argc, argv); }
