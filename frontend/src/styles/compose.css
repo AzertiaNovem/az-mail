@@ -1,13 +1,562 @@
 /*
- * Compose dock / window styles [WP-F]. Imported from components/compose/ComposeDock.tsx.
+ * Compose dock / window, editor body and settings/admin page styles [WP-F]. Imported from
+ * components/compose/ComposeDock.tsx (and the settings / admin pages).
  * `@reference` makes the theme tokens and utilities from index.css available to `@apply`
  * without emitting index.css a second time (Tailwind v4).
+ *
+ * Look: Gmail's current light compose window — #f2f6fc title bar with dark text, 8 px top
+ * corners, the large compose shadow, hairline field separators, blue pill "发送".
  */
 @reference "./index.css";
 
+/* ───────────── dock ───────────── */
+
 .compose-dock {
   @apply pointer-events-none fixed right-4 bottom-0 z-[800] flex flex-row-reverse items-end gap-4;
+  max-width: calc(100vw - 32px);
 }
-.compose-dock-chip {
-  @apply pointer-events-auto flex h-10 w-64 items-center gap-2 rounded-t-lg bg-surface-container-high pl-4 pr-1 text-sm text-on-surface shadow-elevation-2;
+
+.compose-backdrop {
+  @apply pointer-events-auto fixed inset-0 animate-fade-in;
+  z-index: 1;
+  background: rgb(0 0 0 / 0.5);
+}
+
+/* ───────────── window ───────────── */
+
+.cw {
+  --cw-shadow: 0 8px 10px 1px rgb(0 0 0 / 0.14), 0 3px 14px 2px rgb(0 0 0 / 0.12), 0 5px 5px -3px rgb(0 0 0 / 0.2);
+  @apply pointer-events-auto relative flex flex-col overflow-hidden bg-surface-container text-on-surface;
+  width: 540px;
+  max-width: calc(100vw - 32px);
+  height: min(600px, calc(100dvh - 72px));
+  border-radius: 8px 8px 0 0;
+  box-shadow: var(--cw-shadow);
+  animation: cw-in 160ms var(--ease-emphasized);
+}
+
+@keyframes cw-in {
+  from {
+    transform: translateY(24px);
+    opacity: 0.6;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+.cw.is-min {
+  width: 280px;
+  height: 40px;
+}
+
+.cw.is-max {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  z-index: 2;
+  width: min(1120px, calc(100vw - 96px));
+  max-width: none;
+  height: calc(100dvh - 96px);
+  transform: translate(-50%, -50%);
+  border-radius: 8px;
+  animation: none;
+}
+
+.cw-titlebar {
+  @apply flex h-10 shrink-0 cursor-pointer select-none items-center gap-2 pr-1.5 pl-4;
+  background-color: #f2f6fc;
+  color: #041e49;
+}
+.cw-titlebar:hover {
+  background-color: #e9eef6;
+}
+.cw-title {
+  @apply m-0 flex h-full min-w-0 flex-1 text-sm font-medium;
+}
+.cw-title-button {
+  @apply h-full w-full min-w-0 cursor-pointer truncate border-0 bg-transparent p-0 text-left font-medium text-inherit;
+  font: inherit;
+}
+.cw-title-button:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+.cw-title-actions {
+  @apply flex items-center;
+}
+.cw-title-actions button {
+  @apply size-7 text-[#444746];
+}
+
+.cw-body {
+  @apply relative flex min-h-0 flex-1 flex-col;
+}
+
+/* ───────────── header fields ───────────── */
+
+.cw-fields {
+  @apply shrink-0;
+}
+
+.cw-field {
+  @apply relative mx-4 flex min-h-10 items-center gap-2 border-b text-sm;
+  border-color: #f1f3f4;
+}
+.cw-field.is-focused {
+  border-color: #c4c7c5;
+}
+
+.cw-field-label {
+  @apply shrink-0 select-none text-on-surface-variant;
+}
+/* Recipient rows grow when chips wrap: keep the label and 抄送/密送 on the first line. */
+.cw-recipients {
+  @apply items-start;
+}
+.cw-recipients > .cw-field-label {
+  @apply pt-[9px];
+}
+
+.cw-chips {
+  @apply flex min-w-0 flex-1 flex-wrap items-center gap-1 py-1;
+}
+
+.cw-chip {
+  @apply inline-flex h-6 max-w-[260px] items-center gap-1 rounded-full border border-[#dadce0] bg-surface-container pr-0.5 pl-0.5 text-[13px] text-on-surface;
+}
+.cw-chip > span:nth-child(2) {
+  @apply px-0.5;
+}
+.cw-chip:hover {
+  @apply bg-hover;
+}
+.cw-chip.is-invalid {
+  border-color: #f28b82;
+  background-color: #fce8e6;
+  color: #a50e0e;
+}
+.cw-chip-icon {
+  color: #d93025;
+}
+.cw-chip-remove {
+  @apply inline-flex size-5 shrink-0 items-center justify-center rounded-full text-on-surface-variant;
+}
+.cw-chip-remove:hover {
+  @apply bg-on-surface/10 text-on-surface;
+}
+
+.cw-recipient-input {
+  @apply h-7 min-w-[64px] flex-1 border-0 bg-transparent p-0 text-sm text-on-surface outline-none;
+}
+.cw-recipient-input:focus-visible {
+  outline: none;
+}
+
+.cw-ccbcc {
+  @apply flex shrink-0 items-center gap-2 pt-[9px];
+}
+.cw-ccbcc button {
+  @apply rounded px-0.5 text-sm text-on-surface-variant;
+}
+.cw-ccbcc button:hover {
+  @apply text-on-surface underline;
+}
+
+.cw-suggest {
+  @apply absolute top-full right-0 left-0 z-20 m-0 mt-px max-h-72 list-none overflow-y-auto rounded-lg bg-surface-container py-2 shadow-elevation-2;
+}
+.cw-suggest-item {
+  @apply flex h-12 cursor-pointer items-center gap-3 px-4;
+}
+.cw-suggest-item.is-active {
+  @apply bg-on-surface/8;
+}
+.cw-suggest-kind {
+  @apply shrink-0 rounded-full bg-secondary-container px-2 py-0.5 text-[11px] text-on-secondary-container;
+}
+
+.cw-from-select {
+  @apply h-9 min-w-0 flex-1 cursor-pointer appearance-none truncate border-0 bg-transparent pr-7 text-sm text-on-surface outline-none;
+}
+
+.cw-subject {
+  @apply h-10 w-full border-0 bg-transparent p-0 text-sm text-on-surface outline-none placeholder:text-on-surface-variant;
+}
+.cw-subject:focus-visible {
+  outline: none;
+}
+
+/* ───────────── body ───────────── */
+
+.cw-scroll {
+  @apply flex min-h-0 flex-1 cursor-text flex-col overflow-y-auto px-4 pt-2 pb-3;
+}
+/* The body fills the scroll area, so clicking below the text still places the caret. */
+.cw-scroll > .azm-editor {
+  @apply flex shrink-0 grow flex-col;
+}
+.cw-scroll > .azm-editor > .azm-editor-content {
+  @apply grow;
+}
+.azm-signature-editor .azm-editor-content {
+  min-height: 7rem;
+}
+
+.cw-quote {
+  @apply mt-1 cursor-default;
+}
+.cw-quote-toggle {
+  @apply inline-flex h-3 w-6 items-center justify-center rounded-sm border border-[#dadce0] bg-[#e8eaed] text-on-surface-variant;
+}
+.cw-quote-toggle:hover {
+  @apply bg-[#dadce0] text-on-surface;
+}
+.cw-quote-toggle .material-symbols-outlined {
+  font-size: 16px !important;
+}
+.cw-quote-body {
+  @apply mt-2;
+}
+.cw-quote-frame {
+  @apply block w-full border-0 bg-white;
+  min-height: 40px;
+}
+
+.cw-attachments {
+  @apply m-0 mt-3 flex list-none flex-col gap-1.5 p-0;
+}
+.cw-attachment {
+  @apply relative flex h-8 max-w-[420px] items-center gap-2 overflow-hidden rounded bg-[#f5f5f5] pr-1 pl-2 text-[13px];
+}
+.cw-attachment.is-error {
+  background-color: #fce8e6;
+}
+.cw-attachment-name {
+  @apply min-w-0 flex-1 truncate font-medium text-link no-underline;
+}
+a.cw-attachment-name:hover {
+  @apply underline;
+}
+.cw-attachment-name.is-pending {
+  @apply text-on-surface;
+}
+.cw-attachment-size {
+  @apply shrink-0 text-on-surface-variant;
+}
+.cw-attachment-remove {
+  @apply inline-flex size-6 shrink-0 items-center justify-center rounded-full text-on-surface-variant;
+}
+.cw-attachment-remove:hover {
+  @apply bg-on-surface/10 text-on-surface;
+}
+.cw-progress {
+  @apply absolute right-0 bottom-0 left-0 h-[3px] bg-primary/15;
+}
+.cw-progress-bar {
+  @apply block h-full bg-primary transition-[width] duration-200;
+}
+
+/* ───────────── formatting bar + actions ───────────── */
+
+.cw-format-bar {
+  @apply mx-4 mb-1;
+}
+
+.azm-toolbar {
+  @apply flex h-10 shrink-0 items-center gap-px overflow-x-auto overflow-y-hidden rounded bg-surface-container px-1;
+  box-shadow: 0 1px 2px 0 rgb(60 64 67 / 0.3), 0 1px 3px 1px rgb(60 64 67 / 0.15);
+  scrollbar-width: none;
+}
+.azm-toolbar .azm-tool {
+  @apply size-7 shrink-0;
+}
+
+.cw-actions {
+  @apply flex h-14 shrink-0 items-center gap-1 px-4;
+}
+.cw-action-icons {
+  @apply ml-2 flex min-w-0 items-center gap-0.5 overflow-hidden;
+}
+.cw-save-state {
+  @apply ml-auto shrink-0 truncate pl-2 text-xs text-on-surface-variant;
+}
+
+.cw-send {
+  @apply inline-flex h-9 shrink-0 items-stretch overflow-hidden rounded-full bg-primary text-on-primary transition-shadow;
+}
+.cw-send:not(.is-disabled):hover {
+  @apply shadow-elevation-1;
+}
+.cw-send.is-disabled {
+  opacity: 0.6;
+}
+.cw-send-main {
+  @apply inline-flex items-center gap-2 pr-4 pl-6 text-sm font-medium tracking-[0.01em];
+}
+.cw-send-main:not(:disabled):hover,
+.cw-send-more:not(:disabled):hover {
+  background-color: rgb(255 255 255 / 0.08);
+}
+.cw-send-more {
+  @apply inline-flex w-8 items-center justify-center border-l pr-1;
+  border-color: rgb(255 255 255 / 0.35);
+}
+.cw-send button:disabled {
+  cursor: default;
+}
+.cw-send button:focus-visible {
+  outline: 2px solid #ffffff;
+  outline-offset: -4px;
+}
+
+/* ───────────── drop overlay ───────────── */
+
+.cw-drop {
+  @apply absolute inset-2 z-10 flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-primary text-center animate-fade-in;
+  background-color: rgb(211 227 253 / 0.92);
+}
+.cw-drop-title {
+  @apply pointer-events-none text-xl text-on-primary-container;
+}
+.cw-drop-hint {
+  @apply pointer-events-none text-xs text-on-surface-variant;
+}
+
+/* ───────────── schedule dialog ───────────── */
+
+.cw-schedule-option {
+  @apply flex h-12 w-full items-center gap-3 px-6 text-sm text-on-surface transition-colors;
+}
+.cw-schedule-option:hover,
+.cw-schedule-option:focus-visible {
+  @apply bg-on-surface/8;
+  outline: none;
+}
+
+/* ───────────── editor content (compose body + signature editor) ───────────── */
+
+.azm-editor {
+  @apply text-sm;
+}
+.azm-editor-content {
+  @apply min-h-24 outline-none;
+  font-family: Arial, Helvetica, "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #222222;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.azm-editor-content:focus-visible {
+  outline: none;
+}
+.azm-editor-content p {
+  @apply m-0;
+  min-height: 1.5em;
+}
+.azm-editor-content h1 {
+  @apply my-2 text-2xl font-semibold;
+}
+.azm-editor-content h2 {
+  @apply my-2 text-xl font-semibold;
+}
+.azm-editor-content h3 {
+  @apply my-2 text-lg font-semibold;
+}
+.azm-editor-content ul {
+  @apply my-1 list-disc pl-6;
+}
+.azm-editor-content ol {
+  @apply my-1 list-decimal pl-6;
+}
+.azm-editor-content li > p {
+  min-height: 0;
+}
+.azm-editor-content blockquote {
+  margin: 0 0 0 0.8ex;
+  border-left: 1px solid #cccccc;
+  padding-left: 1ex;
+}
+.azm-editor-content a {
+  @apply text-link underline;
+}
+.azm-editor-content img {
+  @apply inline-block h-auto max-w-full align-bottom;
+}
+.azm-editor-content img.ProseMirror-selectednode {
+  outline: 2px solid var(--color-primary);
+}
+.azm-editor-content hr {
+  @apply my-3 border-0 border-t border-divider;
+}
+.azm-editor-content code {
+  @apply rounded bg-[#f1f3f4] px-1 font-mono text-[13px];
+}
+.azm-editor-content .azm-signature {
+  @apply mt-1;
+  color: #5f6368;
+}
+.azm-editor-content > p.is-empty:first-child::before {
+  content: attr(data-placeholder);
+  @apply pointer-events-none float-left h-0 text-on-surface-variant;
+}
+
+/* ───────────── settings / admin pages ───────────── */
+
+.azm-page {
+  @apply flex h-full min-h-0 flex-col overflow-hidden rounded-card bg-surface-container;
+}
+.azm-page-header {
+  @apply flex shrink-0 items-center gap-3 px-6 pt-5 pb-2;
+}
+.azm-page-title {
+  @apply m-0 text-[22px] font-normal text-on-surface;
+}
+.azm-tabs {
+  @apply flex shrink-0 gap-1 overflow-x-auto border-b border-divider px-4;
+  scrollbar-width: none;
+}
+.azm-tab {
+  @apply relative inline-flex h-12 shrink-0 items-center px-4 text-sm font-medium whitespace-nowrap text-on-surface-variant no-underline transition-colors;
+}
+.azm-tab:hover {
+  @apply bg-on-surface/5 text-on-surface;
+}
+.azm-tab.active,
+.azm-tab[aria-current="page"],
+.azm-tab[aria-selected="true"] {
+  @apply text-primary;
+}
+.azm-tab.active::after,
+.azm-tab[aria-current="page"]::after,
+.azm-tab[aria-selected="true"]::after {
+  content: "";
+  @apply absolute right-2 bottom-0 left-2 h-[3px] rounded-t-full bg-primary;
+}
+.azm-page-body {
+  @apply min-h-0 flex-1 overflow-y-auto px-6 py-4;
+}
+
+.azm-settings-row {
+  @apply grid gap-2 border-b border-divider py-5 md:grid-cols-[220px_1fr] md:gap-8;
+}
+.azm-settings-row:last-child {
+  @apply border-b-0;
+}
+.azm-settings-label {
+  @apply text-sm font-medium text-on-surface;
+}
+.azm-settings-help {
+  @apply mt-1 text-xs text-on-surface-variant;
+}
+
+.azm-save-bar {
+  @apply flex shrink-0 items-center gap-2 border-t border-divider bg-surface-container px-6 py-3;
+}
+
+.azm-card {
+  @apply rounded-xl border border-divider bg-surface-container p-4;
+}
+
+.azm-table-wrap {
+  @apply overflow-x-auto rounded-lg border border-divider;
+}
+.azm-table {
+  @apply w-full border-collapse text-left text-sm;
+}
+.azm-table th {
+  @apply h-10 bg-surface-container-low px-3 text-xs font-medium whitespace-nowrap text-on-surface-variant;
+  border-bottom: 1px solid var(--color-divider);
+}
+.azm-table td {
+  @apply h-12 px-3 align-middle text-on-surface;
+  border-bottom: 1px solid var(--color-divider);
+}
+.azm-table tr:last-child td {
+  border-bottom: 0;
+}
+.azm-table tbody tr:hover td {
+  @apply bg-hover;
+}
+.azm-table .num {
+  @apply text-right tabular-nums;
+}
+.azm-mono {
+  @apply font-mono text-xs;
+}
+
+.azm-chip {
+  @apply inline-flex h-6 items-center gap-1 rounded-full px-2.5 text-xs font-medium whitespace-nowrap;
+}
+.azm-chip.tone-neutral {
+  @apply bg-[#e8eaed] text-on-surface-variant;
+}
+.azm-chip.tone-info {
+  @apply bg-primary-container text-on-primary-container;
+}
+.azm-chip.tone-success {
+  @apply bg-success-container text-success;
+}
+.azm-chip.tone-warning {
+  @apply bg-warning-container text-warning;
+}
+.azm-chip.tone-error {
+  @apply bg-error-container text-on-error-container;
+}
+
+.azm-banner {
+  @apply flex items-start gap-3 rounded-lg px-4 py-3 text-sm;
+}
+.azm-banner.tone-warning {
+  @apply bg-warning-container text-warning;
+}
+.azm-banner.tone-error {
+  @apply bg-error-container text-on-error-container;
+}
+
+.azm-segmented {
+  @apply inline-flex overflow-hidden rounded-full border border-outline;
+}
+.azm-segmented button {
+  @apply inline-flex h-8 items-center gap-1 px-4 text-[13px] font-medium text-on-surface-variant transition-colors;
+}
+.azm-segmented button + button {
+  @apply border-l border-outline;
+}
+.azm-segmented button[aria-pressed="true"] {
+  @apply bg-secondary-container text-on-secondary-container;
+}
+
+/* ───────────── phones: compose fills the screen ───────────── */
+
+@media (max-width: 639px) {
+  .compose-dock {
+    @apply right-0 left-0 max-w-none justify-start gap-2 px-2;
+  }
+  .cw:not(.is-min),
+  .cw.is-max {
+    position: fixed;
+    inset: 0;
+    z-index: 3;
+    width: 100%;
+    max-width: none;
+    height: 100%;
+    transform: none;
+    border-radius: 0;
+  }
+  .cw.is-focused:not(.is-min) {
+    z-index: 4;
+  }
+  .cw.is-min {
+    width: 160px;
+  }
+  .compose-backdrop {
+    display: none;
+  }
+  .cw-action-icons {
+    @apply ml-1;
+  }
 }
