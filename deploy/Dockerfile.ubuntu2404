@@ -1,0 +1,58 @@
+# Linux compatibility check (DESIGN F1): builds the backend and runs the unit tests on
+# Ubuntu 24.04 with its stock toolchain — GCC 13, CMake 3.28, Boost 1.83, OpenSSL 3.0,
+# SQLite 3.45 (FTS5 trigram), Catch2 3.4 — first with ASan/UBSan (linux-debug), then the
+# release build (linux-release). The final stage is a minimal runtime image.
+#
+#   docker build -f deploy/Dockerfile.ubuntu2404 -t azmail:ubuntu2404 .
+#   docker build -f deploy/Dockerfile.ubuntu2404 --target build .      # CI: build + tests only
+#   docker run --rm azmail:ubuntu2404 version
+#
+# The repository root is the build context (backend/ and tools/ — the Python mock is used by
+# the Resend client tests).
+
+FROM ubuntu:24.04 AS build
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build pkg-config git ca-certificates \
+      libboost-dev libboost-json-dev libboost-url-dev libboost-program-options-dev \
+      libssl-dev libsqlite3-dev catch2 python3 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY backend/CMakeLists.txt backend/CMakePresets.json backend/
+COPY backend/cmake backend/cmake
+COPY backend/src backend/src
+COPY backend/tests backend/tests
+COPY tools tools
+
+# Sanitizer build + unit tests. LeakSanitizer needs ptrace-like access that some container
+# runtimes forbid; override with --build-arg ASAN_OPTIONS=detect_leaks=0 if it aborts there.
+ARG ASAN_OPTIONS=""
+ARG JOBS=""
+RUN cmake --preset linux-debug -S backend -G Ninja \
+ && cmake --build backend/build/linux-debug -j "${JOBS:-$(nproc)}" \
+ && ASAN_OPTIONS="${ASAN_OPTIONS}" ctest --test-dir backend/build/linux-debug --output-on-failure -j "${JOBS:-$(nproc)}"
+
+# Release build + unit tests (the binary that is deployed).
+RUN cmake --preset linux-release -S backend -G Ninja \
+ && cmake --build backend/build/linux-release -j "${JOBS:-$(nproc)}" \
+ && ctest --test-dir backend/build/linux-release --output-on-failure -j "${JOBS:-$(nproc)}" \
+ && strip -o /azmail backend/build/linux-release/azmail \
+ && /azmail version
+
+FROM ubuntu:24.04 AS runtime
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates libboost-json1.83.0 libboost-url1.83.0 libboost-program-options1.83.0 \
+      libssl3t64 libsqlite3-0 tzdata \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --home-dir /var/lib/azmail --create-home --shell /usr/sbin/nologin azmail
+COPY --from=build /azmail /usr/local/bin/azmail
+USER azmail
+WORKDIR /var/lib/azmail
+ENV AZMAIL_DATA_DIR=/var/lib/azmail AZMAIL_DB_PATH=/var/lib/azmail/azmail.db AZMAIL_LISTEN_ADDRESS=0.0.0.0
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/azmail"]
+CMD ["serve"]
