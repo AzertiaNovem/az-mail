@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript", "unicorn", "oxc", "vitest", "jsx-a11y"],
+  "categories": {
+    "correctness": "error"
+  },
+  "env": { "browser": true, "es2024": true },
+  "ignorePatterns": ["dist/**", "node_modules/**", "public/config.js"],
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/exhaustive-deps": "warn",
+    "react/jsx-key": "error",
+    "react/react-in-jsx-scope": "off",
+    "unicorn/no-useless-spread": "off",
+    "jsx-a11y/no-autofocus": "off",
+    "jsx-a11y/prefer-tag-over-role": "off",
+    "vitest/require-mock-type-parameters": "off"
+  }
+}

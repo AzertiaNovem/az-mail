@@ -1,0 +1,25 @@
+# build
+backend/build/
+backend/out/
+**/CMakeUserPresets.json
+compile_commands.json
+# frontend
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+*.tsbuildinfo
+# runtime data
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+*.env.local
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+# os/editor
+.DS_Store
+.idea/
+.vscode/

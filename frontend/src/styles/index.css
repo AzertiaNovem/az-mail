@@ -1,0 +1,196 @@
+/*
+ * Global styles: Tailwind v4 + Gmail-like Material 3 tokens.
+ * No external font CDN (blocked in mainland China): system CJK font stack + self-hosted
+ * Material Symbols Outlined from the `material-symbols` package.
+ * Feature styles live in mail.css [E] and compose.css [F]. They are NOT imported here: each is
+ * imported from its package's root component (mail.css from AppShell, compose.css from
+ * ComposeDock) and starts with `@reference "./index.css";`, which Tailwind v4 needs for `@apply`
+ * and theme tokens in a separately imported file (it emits nothing from index.css again).
+ *
+ * Font note: material-symbols ships the full ~4 MB variable woff2 with `font-display: block`
+ * (icons stay blank until it loads). Subsetting it to the ligatures actually used (pyftsubset
+ * build step) is a planned optimization for slow cross-border links (DESIGN.md §1 E1).
+ */
+@import "tailwindcss";
+/* Layered so Tailwind utilities (e.g. text-error, size overrides) win over the icon defaults. */
+@import "material-symbols/outlined.css" layer(components);
+
+@theme {
+  --font-sans: "Google Sans", Roboto, "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* Surfaces */
+  --color-surface: #f6f8fc; /* app background */
+  --color-surface-container: #ffffff; /* cards: list, reading pane, dialogs */
+  --color-surface-container-low: #f8fafd;
+  --color-surface-container-high: #eaf1fb; /* search box */
+  --color-surface-container-highest: #e1e5ea;
+  --color-hover: #f2f6fc; /* generic hover fill */
+  --color-nav-hover: #e9ebee;
+  --color-nav-selected: #d3e3fd;
+  --color-on-nav-selected: #001d35;
+
+  /* Compose (FAB) */
+  --color-compose: #c2e7ff;
+  --color-compose-hover: #b3dcf6;
+  --color-on-compose: #001d35;
+
+  /* Text & lines */
+  --color-on-surface: #1f1f1f;
+  --color-on-surface-variant: #444746;
+  --color-muted: #5f6368;
+  --color-outline: #747775;
+  --color-outline-variant: #c4c7c5;
+  --color-divider: #e3e6ea;
+
+  /* Brand */
+  --color-primary: #0b57d0;
+  --color-primary-hover: #1e64d4;
+  --color-on-primary: #ffffff;
+  --color-primary-container: #d3e3fd;
+  --color-on-primary-container: #041e49;
+  --color-secondary-container: #c2e7ff;
+  --color-on-secondary-container: #001d35;
+  --color-link: #0b57d0;
+
+  /* Thread rows */
+  --color-row-unread: #ffffff;
+  --color-row-read: #f2f6fc;
+  --color-row-selected: #c2dbff;
+
+  /* Status */
+  --color-error: #b3261e;
+  --color-error-container: #f9dedc;
+  --color-on-error-container: #410e0b;
+  --color-warning: #8c4a00;
+  --color-warning-container: #fef7e0;
+  --color-success: #146c2e;
+  --color-success-container: #c4eed0;
+  --color-star: #f4b400;
+
+  /* Inverse (toasts, tooltips) */
+  --color-inverse-surface: #303030;
+  --color-inverse-on-surface: #f2f2f2;
+  --color-inverse-primary: #a8c7fa;
+  --color-tooltip: #444746;
+
+  --color-scrim: rgb(0 0 0 / 0.32);
+
+  /* Elevation */
+  --shadow-elevation-1: 0 1px 2px 0 rgb(60 64 67 / 0.3), 0 1px 3px 1px rgb(60 64 67 / 0.15);
+  --shadow-elevation-2: 0 1px 2px 0 rgb(60 64 67 / 0.3), 0 2px 6px 2px rgb(60 64 67 / 0.15);
+  --shadow-elevation-3: 0 4px 8px 3px rgb(60 64 67 / 0.15), 0 1px 3px 0 rgb(60 64 67 / 0.3);
+  --shadow-row-hover: inset 1px 0 0 #dadce0, inset -1px 0 0 #dadce0, 0 1px 2px 0 rgb(60 64 67 / 0.3),
+    0 1px 3px 1px rgb(60 64 67 / 0.15);
+
+  --radius-card: 16px;
+
+  /* Motion */
+  --ease-emphasized: cubic-bezier(0.2, 0, 0, 1);
+  --animate-toast-in: toast-in 180ms var(--ease-emphasized);
+  --animate-fade-in: fade-in 120ms ease-out;
+  --animate-scale-in: scale-in 150ms var(--ease-emphasized);
+
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translateY(12px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes scale-in {
+    from {
+      opacity: 0;
+      transform: scale(0.96);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  html {
+    color-scheme: light;
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    margin: 0;
+    background-color: var(--color-surface);
+    color: var(--color-on-surface);
+    font-family: var(--font-sans);
+    font-size: 0.875rem;
+    line-height: 1.43;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  ::selection {
+    background-color: #c2dbff;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
+  }
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+  /* Thin, unobtrusive scrollbars (Gmail style). */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(0 0 0 / 0.2) transparent;
+  }
+}
+
+/*
+ * Material Symbols defaults. <Icon> sets --icon-fill / --icon-wght / font-size per instance.
+ * The fixed 1em box keeps ligature text from shifting layout before the font loads.
+ */
+@layer components {
+.material-symbols-outlined {
+  font-size: 20px;
+  width: 1em;
+  height: 1em;
+  overflow: hidden;
+  flex-shrink: 0;
+  user-select: none;
+  vertical-align: middle;
+  font-variation-settings:
+    "FILL" var(--icon-fill, 0),
+    "wght" var(--icon-wght, 400),
+    "GRAD" var(--icon-grad, 0),
+    "opsz" var(--icon-opsz, 20);
+}
+}
+
+/* Thread rows: unread rows are white and bold, read rows sit on the tinted surface. */
+@utility row-unread {
+  background-color: var(--color-row-unread);
+  color: var(--color-on-surface);
+  font-weight: 700;
+}
+@utility row-read {
+  background-color: var(--color-row-read);
+  color: var(--color-on-surface);
+  font-weight: 400;
+}
+@utility row-selected {
+  background-color: var(--color-row-selected);
+}

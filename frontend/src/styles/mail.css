@@ -1,0 +1,6 @@
+/*
+ * Mail UI styles [WP-E]. Import it from the mail package's root component (AppShell).
+ * `@reference` makes the theme tokens and utilities from index.css available to `@apply`
+ * without emitting index.css a second time (Tailwind v4).
+ */
+@reference "./index.css";

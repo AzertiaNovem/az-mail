@@ -1,0 +1,13 @@
+/*
+ * Compose dock / window styles [WP-F]. Imported from components/compose/ComposeDock.tsx.
+ * `@reference` makes the theme tokens and utilities from index.css available to `@apply`
+ * without emitting index.css a second time (Tailwind v4).
+ */
+@reference "./index.css";
+
+.compose-dock {
+  @apply pointer-events-none fixed right-4 bottom-0 z-[800] flex flex-row-reverse items-end gap-4;
+}
+.compose-dock-chip {
+  @apply pointer-events-auto flex h-10 w-64 items-center gap-2 rounded-t-lg bg-surface-container-high pl-4 pr-1 text-sm text-on-surface shadow-elevation-2;
+}

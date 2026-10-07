@@ -1,0 +1,80 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "AZMAIL_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "mac-base",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "/opt/homebrew",
+        "SQLite3_ROOT": "/opt/homebrew/opt/sqlite",
+        "OPENSSL_ROOT_DIR": "/opt/homebrew/opt/openssl@3"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+    },
+    {
+      "name": "mac-debug",
+      "displayName": "macOS Debug (ASan/UBSan, Homebrew deps)",
+      "inherits": "mac-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "AZMAIL_SANITIZE": "ON"
+      }
+    },
+    {
+      "name": "mac-release",
+      "displayName": "macOS Release (Homebrew deps)",
+      "inherits": "mac-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "AZMAIL_SANITIZE": "OFF"
+      }
+    },
+    {
+      "name": "linux-debug",
+      "displayName": "Linux Debug (ASan/UBSan, system deps)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "AZMAIL_SANITIZE": "ON"
+      }
+    },
+    {
+      "name": "linux-release",
+      "displayName": "Linux Release (system deps)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "AZMAIL_SANITIZE": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "mac-debug", "configurePreset": "mac-debug" },
+    { "name": "mac-release", "configurePreset": "mac-release" },
+    { "name": "linux-debug", "configurePreset": "linux-debug" },
+    { "name": "linux-release", "configurePreset": "linux-release" }
+  ],
+  "testPresets": [
+    {
+      "name": "test-base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    { "name": "mac-debug", "inherits": "test-base", "configurePreset": "mac-debug" },
+    { "name": "mac-release", "inherits": "test-base", "configurePreset": "mac-release" },
+    { "name": "linux-debug", "inherits": "test-base", "configurePreset": "linux-debug" },
+    { "name": "linux-release", "inherits": "test-base", "configurePreset": "linux-release" }
+  ]
+}
