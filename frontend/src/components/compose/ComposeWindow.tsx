@@ -1,0 +1,952 @@
+/**
+ * One compose window [WP-F] (DESIGN.md §5): Gmail's light title bar (新邮件 / subject;
+ * minimize · full screen · close), From (aliases), To / Cc / Bcc chips, subject, TipTap body
+ * with the formatting bar, the quoted original behind "…", attachments with progress, and the
+ * action row (发送 ▾ 定时发送 · format · attach · link · photo · signature · 已保存 · discard).
+ *
+ * Behaviour: lazy draft creation on first edit and 1.5 s autosave (useAutosave); close / Esc
+ * saves first (Gmail keeps a draft); discard deletes it; drop / paste uploads (images inline,
+ * never data: URIs); Ctrl/⌘+Enter sends (useDraftSend); version conflicts offer 重新加载 / 覆盖.
+ * Minimized windows stay mounted (title bar only), so the editor keeps its state.
+ */
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useEditorState } from '@tiptap/react';
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type DragEvent, type KeyboardEvent, type ReactNode } from 'react';
+import { useNavigate } from 'react-router';
+import { errorMessage, isApiError } from '@/api/client';
+import { deleteDraft, getDraft, getMessage, getThread } from '@/api/endpoints';
+import { queryKeys, staleTimes } from '@/api/queryKeys';
+import type {
+  Address,
+  Attachment,
+  Draft,
+  DraftInput,
+  Me,
+  UnknownLocalRecipientDetails,
+  VersionConflictDetails,
+} from '@/api/types';
+import { Button, ConfirmDialog, cx, Dialog, DropdownMenu, IconButton, Spinner } from '@/components/common';
+import { resolveApiUrl } from '@/config';
+import { t } from '@/i18n/zh';
+import { attachmentIdsForSave, isBlankHtml } from '@/lib/emailHtml';
+import { safeTimeZone } from '@/lib/quote';
+import { isValidEmail, normalizeEmail } from '@/lib/recipients';
+import { checkUploadSizes, isInlineImage, sizeRejectionMessage, UploadQueue, type UploadItem } from '@/lib/upload';
+import { useComposeStore, type ComposeWin } from '@/stores/compose';
+import { toast } from '@/stores/toast';
+import { AttachmentBar } from './AttachmentBar';
+import { dragHasFiles, EditorSurface, filesFromTransfer, useMailEditor, type Editor } from './Editor';
+import { EditorToolbar } from './EditorToolbar';
+import { hasSignature } from './extensions/Signature';
+import { IdentitySelect } from './IdentitySelect';
+import { LinkDialog } from './LinkDialog';
+import { QuotedToggle } from './QuotedToggle';
+import { RecipientField, type RecipientFieldHandle } from './RecipientField';
+import { SchedulePicker } from './SchedulePicker';
+import { findParent, seedFromDraft, seedFromInit, type ComposeSeed } from './seed';
+import { SendButton } from './SendButton';
+import { DraftConflictError, useAutosave, type AutosaveApi } from './useAutosave';
+import { fieldLabel, preSendCheck, recipientFieldOf, useDraftSend } from './useDraftSend';
+import { useMe } from './useMe';
+
+const FORMATTING_PREF_KEY = 'azmail.compose.formatting';
+
+function readFormattingPref(): boolean {
+  try {
+    return localStorage.getItem(FORMATTING_PREF_KEY) !== '0';
+  } catch {
+    return true;
+  }
+}
+
+function writeFormattingPref(on: boolean): void {
+  try {
+    localStorage.setItem(FORMATTING_PREF_KEY, on ? '1' : '0');
+  } catch {
+    /* storage disabled */
+  }
+}
+
+/** Test seams (autosave API / debounce); production uses the defaults. */
+export interface ComposeTestOptions {
+  autosaveApi?: AutosaveApi;
+  debounceMs?: number;
+}
+
+// ───────────── window shell ─────────────
+
+interface TitleBarProps {
+  win: ComposeWin;
+  titleId: string;
+  title: string;
+  onClose: () => void;
+  busy?: boolean;
+}
+
+function TitleBar({ win, titleId, title, onClose, busy }: TitleBarProps) {
+  const toggleMinimize = useComposeStore((s) => s.toggleMinimize);
+  const toggleMaximize = useComposeStore((s) => s.toggleMaximize);
+  return (
+    <header className="cw-titlebar">
+      <h2 id={titleId} className="cw-title">
+        <button
+          type="button"
+          className="cw-title-button"
+          aria-expanded={!win.minimized}
+          onClick={() => toggleMinimize(win.key)}
+        >
+          {busy ? t('compose.closing') : title}
+        </button>
+      </h2>
+      <div className="cw-title-actions">
+        <IconButton
+          icon={win.minimized ? 'keyboard_arrow_up' : 'remove'}
+          label={win.minimized ? t('compose.restore') : t('compose.minimize')}
+          size="sm"
+          tooltipSide="top"
+          onClick={() => toggleMinimize(win.key)}
+        />
+        <IconButton
+          icon={win.maximized ? 'close_fullscreen' : 'open_in_full'}
+          label={win.maximized ? t('compose.exitMaximize') : t('compose.maximize')}
+          size="sm"
+          iconSize={16}
+          tooltipSide="top"
+          onClick={() => toggleMaximize(win.key)}
+        />
+        <IconButton icon="close" label={t('compose.close')} size="sm" tooltipSide="top" onClick={onClose} disabled={busy} />
+      </div>
+    </header>
+  );
+}
+
+function windowClass(win: ComposeWin, focused: boolean) {
+  return cx('cw', win.minimized && 'is-min', win.maximized && !win.minimized && 'is-max', focused && 'is-focused');
+}
+
+/** Loading / error state with a working title bar. */
+function WindowShell({ win, children }: { win: ComposeWin; children: ReactNode }) {
+  const titleId = useId();
+  const focused = useComposeStore((s) => s.focusedKey === win.key);
+  const close = useComposeStore((s) => s.close);
+  return (
+    <section className={windowClass(win, focused)} role="dialog" aria-labelledby={titleId} data-testid="compose-window">
+      <TitleBar win={win} titleId={titleId} title={win.title || t('compose.newMessage')} onClose={() => close(win.key)} />
+      <div className="cw-body" hidden={win.minimized}>
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center text-sm text-on-surface-variant">
+          {children}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ───────────── loading ─────────────
+
+type LoadState = { status: 'loading' } | { status: 'error'; message: string; retry?: () => void } | { status: 'ready'; seed: ComposeSeed };
+
+function useComposeSeed(win: ComposeWin, me: Me | undefined): LoadState {
+  const init = win.init;
+  const isReply = init.kind === 'reply' || init.kind === 'reply_all' || init.kind === 'forward';
+  const parentId = isReply ? init.parentMessageId : 0;
+  const threadId = isReply ? init.threadId : 0;
+
+  const draftQ = useQuery({
+    queryKey: queryKeys.draft(init.kind === 'draft' ? init.draftId : 0),
+    queryFn: ({ signal }) => getDraft(init.kind === 'draft' ? init.draftId : 0, signal),
+    enabled: init.kind === 'draft',
+    staleTime: staleTimes.draft,
+    retry: false,
+  });
+  const threadQ = useQuery({
+    queryKey: queryKeys.thread(threadId),
+    queryFn: ({ signal }) => getThread(threadId, signal),
+    enabled: isReply,
+    staleTime: staleTimes.thread,
+  });
+  const fromThread = isReply ? findParent(threadQ.data?.messages, parentId) : null;
+  const msgQ = useQuery({
+    queryKey: ['compose', 'parent', parentId] as const,
+    queryFn: ({ signal }) => getMessage(parentId, signal),
+    enabled: isReply && !fromThread && (threadQ.isError || threadQ.isSuccess),
+    staleTime: staleTimes.thread,
+  });
+
+  // The seed is computed once: later cache updates must not reset a form being edited.
+  const [frozen, setFrozen] = useState<ComposeSeed | null>(null);
+  if (frozen) return { status: 'ready', seed: frozen };
+  if (!me) return { status: 'loading' };
+
+  let seed: ComposeSeed;
+  if (init.kind === 'draft') {
+    if (draftQ.data) seed = seedFromDraft(draftQ.data);
+    else if (draftQ.isError)
+      return {
+        status: 'error',
+        message: isApiError(draftQ.error, 'not_found') ? t('compose.draftMissing') : errorMessage(draftQ.error),
+        retry: isApiError(draftQ.error, 'not_found') ? undefined : () => void draftQ.refetch(),
+      };
+    else return { status: 'loading' };
+  } else if (init.kind === 'new') {
+    seed = seedFromInit(init, me, null);
+  } else {
+    const parent = fromThread ?? msgQ.data ?? null;
+    if (parent) seed = seedFromInit(init, me, parent);
+    else if (msgQ.isError)
+      return {
+        status: 'error',
+        message: t('compose.loadFailed'),
+        retry: () => {
+          void threadQ.refetch();
+          void msgQ.refetch();
+        },
+      };
+    else return { status: 'loading' };
+  }
+  setFrozen(seed); // render-phase update: re-renders right away with the frozen seed
+  return { status: 'ready', seed };
+}
+
+// ───────────── window ─────────────
+
+export interface ComposeWindowProps {
+  win: ComposeWin;
+  testOptions?: ComposeTestOptions;
+}
+
+export const ComposeWindow = memo(function ComposeWindow({ win, testOptions }: ComposeWindowProps) {
+  const me = useMe();
+  const load = useComposeSeed(win, me.data);
+  // 重新加载 after a conflict remounts the form with the server's draft.
+  const [reloaded, setReloaded] = useState<{ draft: Draft; n: number } | null>(null);
+  const onReload = useCallback((draft: Draft) => setReloaded((r) => ({ draft, n: (r?.n ?? 0) + 1 })), []);
+
+  if (me.isError && !me.data) {
+    return <WindowShell win={win}>{errorMessage(me.error)}</WindowShell>;
+  }
+  if (!me.data || load.status === 'loading') {
+    return (
+      <WindowShell win={win}>
+        <Spinner />
+        <span>{t('compose.loading')}</span>
+      </WindowShell>
+    );
+  }
+  if (load.status === 'error') {
+    return (
+      <WindowShell win={win}>
+        <span>{load.message}</span>
+        {load.retry && (
+          <Button variant="tonal" size="sm" onClick={load.retry}>
+            {t('actions.retry')}
+          </Button>
+        )}
+      </WindowShell>
+    );
+  }
+  const seed = reloaded ? seedFromDraft(reloaded.draft) : load.seed;
+  return <ComposeForm key={reloaded?.n ?? 0} win={win} me={me.data} seed={seed} onReload={onReload} testOptions={testOptions} />;
+});
+
+// ───────────── form ─────────────
+
+interface Fields {
+  fromAddressId: number | undefined;
+  to: Address[];
+  cc: Address[];
+  bcc: Address[];
+  subject: string;
+  quotedHtml: string | null;
+  attachments: Attachment[];
+}
+
+interface AlertState {
+  title: string;
+  lines: string[];
+}
+
+type UploadSource = 'attach' | 'photo' | 'paste' | 'drop';
+
+const validOnly = (list: readonly Address[]) => list.filter((a) => isValidEmail(a.email));
+
+interface ComposeFormProps {
+  win: ComposeWin;
+  me: Me;
+  seed: ComposeSeed;
+  onReload: (draft: Draft) => void;
+  testOptions?: ComposeTestOptions;
+}
+
+function ComposeForm({ win, me, seed, onReload, testOptions }: ComposeFormProps) {
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const titleId = useId();
+  const focused = useComposeStore((s) => s.focusedKey === win.key);
+  const tz = safeTimeZone(me.settings.timezone);
+  const filesOrigins = me.server.files_origins;
+
+  const rootRef = useRef<HTMLElement>(null);
+  const toRef = useRef<RecipientFieldHandle>(null);
+  const ccRef = useRef<RecipientFieldHandle>(null);
+  const bccRef = useRef<RecipientFieldHandle>(null);
+  const attachInputRef = useRef<HTMLInputElement>(null);
+  const photoInputRef = useRef<HTMLInputElement>(null);
+  const editorRef = useRef<Editor | null>(null);
+  const lastHtmlRef = useRef(seed.html);
+  const editorOwned = useRef(new Set(seed.editorInlineIds));
+
+  const [fields, setFieldsState] = useState<Fields>(() => ({
+    fromAddressId: seed.fromAddressId,
+    to: seed.to,
+    cc: seed.cc,
+    bcc: seed.bcc,
+    subject: seed.subject,
+    quotedHtml: seed.quotedHtml,
+    attachments: seed.attachments,
+  }));
+  const fieldsRef = useRef(fields);
+  const [showCc, setShowCc] = useState(seed.cc.length > 0);
+  const [showBcc, setShowBcc] = useState(seed.bcc.length > 0);
+  const [quoteOpen, setQuoteOpen] = useState(false);
+  const [flagged, setFlagged] = useState<ReadonlySet<string>>(() => new Set());
+  const [showFormatting, setShowFormatting] = useState(readFormattingPref);
+  const [dragging, setDragging] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [linkOpen, setLinkOpen] = useState(false);
+  const [alert, setAlert] = useState<AlertState | null>(null);
+  const [confirmSubject, setConfirmSubject] = useState<{ scheduledAt: number | null } | null>(null);
+  const [conflict, setConflict] = useState<{ current: Draft | null } | null>(null);
+  const [conflictBusy, setConflictBusy] = useState(false);
+  const [closeFailed, setCloseFailed] = useState<string | null>(null);
+
+  const [queue] = useState(() => new UploadQueue());
+  const [uploads, setUploads] = useState<UploadItem[]>([]);
+  useEffect(() => {
+    const unsubscribe = queue.subscribe(setUploads);
+    return () => {
+      unsubscribe();
+      queue.cancelAll();
+    };
+  }, [queue]);
+  const uploadsPending = uploads.some((u) => u.state === 'queued' || u.state === 'uploading');
+
+  // ── autosave ──
+  const collect = useCallback((): DraftInput => {
+    const f = fieldsRef.current;
+    const ed = editorRef.current;
+    const html = ed && !ed.isDestroyed ? ed.getHTML() : lastHtmlRef.current;
+    lastHtmlRef.current = html;
+    return {
+      from_address_id: f.fromAddressId,
+      to: validOnly(f.to),
+      cc: validOnly(f.cc),
+      bcc: validOnly(f.bcc),
+      subject: f.subject,
+      html,
+      quoted_html: f.quotedHtml,
+      attachment_ids: attachmentIdsForSave({ attachments: f.attachments, editorHtml: html, editorOwnedInlineIds: editorOwned.current }),
+    };
+  }, []);
+  const createFields = useCallback(
+    (): DraftInput => ({
+      mode: seed.mode,
+      parent_message_id: seed.parentMessageId,
+      ...(seed.includeParentAttachments ? { include_parent_attachments: true } : {}),
+    }),
+    [seed.mode, seed.parentMessageId, seed.includeParentAttachments],
+  );
+  const saver = useAutosave({
+    winKey: win.key,
+    draftId: seed.draftId,
+    version: seed.version,
+    collect,
+    createFields,
+    onConflict: (current) => setConflict({ current }),
+    api: testOptions?.autosaveApi,
+    debounceMs: testOptions?.debounceMs,
+  });
+
+  const update = useCallback(
+    (patch: Partial<Fields>) => {
+      fieldsRef.current = { ...fieldsRef.current, ...patch };
+      setFieldsState(fieldsRef.current);
+      saver.markDirty();
+    },
+    [saver],
+  );
+
+  // ── editor ──
+  const editor = useMailEditor({
+    initialHtml: seed.html,
+    placeholder: t('compose.bodyPlaceholder'),
+    ariaLabel: t('compose.bodyLabel'),
+    autofocus: win.minimized ? false : seed.focus === 'body-start' ? 'start' : seed.focus === 'body-end' ? 'end' : false,
+    onUpdate: () => saver.markDirty(),
+    onPasteFiles: (files) => addFiles(files, 'paste'),
+    onDropFiles: (files) => addFiles(files, 'drop'),
+  });
+  useLayoutEffect(() => {
+    editorRef.current = editor;
+  }, [editor]);
+  useEffect(() => {
+    const editable = !sending && !closing;
+    // emitUpdate=false: toggling editability is not an edit (it must not create a draft).
+    if (editor && !editor.isDestroyed && editor.isEditable !== editable) editor.setEditable(editable, false);
+  }, [editor, sending, closing]);
+
+  const send = useDraftSend({ winKey: win.key, saver, collect, timeZone: tz });
+
+  // Title bar follows the subject.
+  useEffect(() => {
+    const title = fields.subject.trim();
+    if (useComposeStore.getState().windows.find((w) => w.key === win.key)?.title !== title) {
+      useComposeStore.getState().patch(win.key, { title });
+    }
+  }, [fields.subject, win.key]);
+
+  // ── uploads ──
+  const addFiles = (files: File[], source: UploadSource) => {
+    if (files.length === 0 || sending) return;
+    const wantInline = source !== 'attach';
+    const images = new Set(wantInline ? files.filter(isInlineImage) : []);
+    const existing =
+      fieldsRef.current.attachments.reduce((n, a) => n + a.size, 0) + queue.pendingBytes();
+    const { accepted, rejected } = checkUploadSizes(files, existing);
+    if (rejected.length) setAlert({ title: t('compose.attachments.rejectedTitle'), lines: rejected.map(sizeRejectionMessage) });
+    const inline = accepted.filter((f) => images.has(f));
+    const regular = accepted.filter((f) => !images.has(f));
+    if (inline.length) {
+      queue.add(inline, {
+        inline: true,
+        onDone: (_item, att) => {
+          const ed = editorRef.current;
+          editorOwned.current.add(att.id);
+          update({ attachments: [...fieldsRef.current.attachments, att] });
+          if (ed && !ed.isDestroyed) {
+            ed.chain()
+              .focus()
+              .insertAttachmentImage({ src: resolveApiUrl(att.view_url ?? att.download_url), alt: att.filename, attId: att.id })
+              .run();
+          }
+        },
+      });
+    }
+    if (regular.length) {
+      queue.add(regular, { inline: false, onDone: (_item, att) => update({ attachments: [...fieldsRef.current.attachments, att] }) });
+    }
+  };
+
+  const removeAttachment = (id: number) => update({ attachments: fieldsRef.current.attachments.filter((a) => a.id !== id) });
+
+  // ── close / discard ──
+  const finishClose = () => {
+    saver.dispose();
+    queue.cancelAll();
+    const id = saver.draftId;
+    useComposeStore.getState().close(win.key);
+    if (id !== null) {
+      qc.removeQueries({ queryKey: queryKeys.draft(id), exact: true });
+      void qc.invalidateQueries({ queryKey: queryKeys.threadsAll() });
+      void qc.invalidateQueries({ queryKey: queryKeys.counts() });
+    }
+  };
+
+  const handleClose = async () => {
+    if (closing || sending) return;
+    for (const r of [toRef, ccRef, bccRef]) r.current?.commit();
+    if (saver.inConflict) {
+      setConflict((c) => c ?? { current: null });
+      return;
+    }
+    if (!saver.dirty && !saver.saving) {
+      finishClose();
+      return;
+    }
+    setClosing(true);
+    try {
+      await saver.flush();
+      finishClose();
+    } catch (e) {
+      setClosing(false);
+      if (e instanceof DraftConflictError) setConflict({ current: e.current });
+      else setCloseFailed(errorMessage(e));
+    }
+  };
+
+  const handleDiscard = async () => {
+    if (sending) return;
+    saver.dispose();
+    queue.cancelAll();
+    await saver.settle();
+    const id = saver.draftId;
+    useComposeStore.getState().close(win.key);
+    if (id === null) {
+      toast.push({ message: t('compose.discarded') });
+      return;
+    }
+    try {
+      await deleteDraft(id);
+      toast.push({ message: t('compose.discarded') });
+    } catch (e) {
+      if (!isApiError(e, 'not_found')) toast.error(t('compose.discardFailed', { reason: errorMessage(e) }));
+    }
+    qc.removeQueries({ queryKey: queryKeys.draft(id), exact: true });
+    void qc.invalidateQueries({ queryKey: queryKeys.threadsAll() });
+    void qc.invalidateQueries({ queryKey: queryKeys.counts() });
+  };
+
+  // ── send ──
+  const handleSendError = (e: unknown) => {
+    if (e instanceof DraftConflictError) {
+      setConflict({ current: e.current });
+      return;
+    }
+    if (isApiError(e, 'version_conflict')) {
+      const current = (e.detailsAs<VersionConflictDetails>().current as Draft | undefined) ?? null;
+      saver.enterConflict(current);
+      setConflict({ current });
+      return;
+    }
+    const title = t('compose.errors.title');
+    if (isApiError(e, 'unknown_local_recipient')) {
+      const emails = (e.detailsAs<UnknownLocalRecipientDetails>().emails ?? []).filter((x) => typeof x === 'string');
+      const set = new Set(emails.map(normalizeEmail));
+      setFlagged(set);
+      if (fieldsRef.current.cc.some((a) => set.has(normalizeEmail(a.email)))) setShowCc(true);
+      if (fieldsRef.current.bcc.some((a) => set.has(normalizeEmail(a.email)))) setShowBcc(true);
+      setAlert({ title, lines: [emails.length ? t('compose.errors.unknownLocal', { emails: emails.join('、') }) : e.message] });
+      return;
+    }
+    if (isApiError(e, 'too_many_recipients')) {
+      const field = recipientFieldOf(e.details.field);
+      setAlert({ title, lines: [field ? t('compose.errors.tooMany', { field: fieldLabel(field) }) : e.message] });
+      return;
+    }
+    if (isApiError(e, 'no_recipients')) {
+      setAlert({ title, lines: [t('compose.errors.noRecipients')] });
+      return;
+    }
+    setAlert({ title, lines: [errorMessage(e)] });
+  };
+
+  const handleSend = async (scheduledAt: number | null = null, subjectConfirmed = false) => {
+    if (sending || closing || uploadsPending) return;
+    for (const r of [toRef, ccRef, bccRef]) r.current?.commit();
+    const f = fieldsRef.current;
+    const problem = preSendCheck(f);
+    if (problem) {
+      const title = t('compose.errors.title');
+      if (problem.kind === 'no_recipients') setAlert({ title, lines: [t('compose.errors.noRecipients')] });
+      else if (problem.kind === 'invalid_address') setAlert({ title, lines: [t('compose.errors.invalidAddress', { address: problem.address })] });
+      else setAlert({ title, lines: [t('compose.errors.tooMany', { field: fieldLabel(problem.field) })] });
+      if (problem.kind !== 'no_recipients') {
+        if (problem.field === 'cc') setShowCc(true);
+        if (problem.field === 'bcc') setShowBcc(true);
+      }
+      return;
+    }
+    if (!subjectConfirmed && !f.subject.trim()) {
+      setConfirmSubject({ scheduledAt });
+      return;
+    }
+    setSending(true);
+    setFlagged(new Set());
+    const outcome = await send(scheduledAt);
+    if (outcome.ok) return; // the window is closed
+    setSending(false);
+    saver.resume();
+    handleSendError(outcome.error);
+  };
+
+  // ── conflict resolution ──
+  const reloadFromServer = async () => {
+    setConflictBusy(true);
+    try {
+      const current = conflict?.current ?? (saver.draftId !== null ? await getDraft(saver.draftId) : null);
+      if (!current) return;
+      qc.setQueryData(queryKeys.draft(current.id), current);
+      saver.acceptReload(current);
+      saver.dispose();
+      queue.cancelAll();
+      setConflict(null);
+      onReload(current);
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setConflictBusy(false);
+    }
+  };
+
+  const overwriteServer = async () => {
+    setConflictBusy(true);
+    try {
+      await saver.overwrite();
+      setConflict(null);
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setConflictBusy(false);
+    }
+  };
+
+  // ── drag & drop ──
+  useEffect(() => {
+    if (!dragging) return;
+    const reset = () => setDragging(false);
+    window.addEventListener('drop', reset);
+    window.addEventListener('dragend', reset);
+    return () => {
+      window.removeEventListener('drop', reset);
+      window.removeEventListener('dragend', reset);
+    };
+  }, [dragging]);
+
+  const onDragEnter = (e: DragEvent) => {
+    if (win.minimized || sending || !dragHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    setDragging(true);
+  };
+
+  // ── keyboard ──
+  const onKeyDown = (e: KeyboardEvent) => {
+    // Events from portaled dialogs bubble through React; only handle our own DOM.
+    if (!rootRef.current?.contains(e.target as Node)) return;
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && e.key === 'Enter') {
+      e.preventDefault();
+      void handleSend();
+      return;
+    }
+    if (mod && (e.key === 'k' || e.key === 'K') && editor?.isFocused) {
+      e.preventDefault();
+      setLinkOpen(true);
+      return;
+    }
+    if (e.key === 'Escape' && !e.defaultPrevented) {
+      e.preventDefault();
+      void handleClose();
+    }
+  };
+
+  const focusWindow = () => {
+    // A minimized chip is expanded by its title-bar click; focusing on pointerdown would
+    // expand it first and the click would minimize it again.
+    if (win.minimized) return;
+    if (useComposeStore.getState().focusedKey !== win.key) useComposeStore.getState().focus(win.key);
+  };
+
+  const busy = sending || closing;
+  const title = fields.subject.trim() || t('compose.newMessage');
+  const saveText =
+    win.saveState === 'saving'
+      ? t('compose.saveState.saving')
+      : win.saveState === 'saved' || (win.saveState === 'dirty' && win.draftId !== null)
+        ? t('compose.saveState.saved')
+        : win.saveState === 'error'
+          ? t('compose.saveState.error')
+          : win.saveState === 'conflict'
+            ? t('compose.saveState.conflict')
+            : '';
+  const regularAttachments = fields.attachments.filter((a) => !a.inline);
+
+  return (
+    // A non-modal dialog handles its own shortcuts (Esc, Ctrl+Enter), focus, blur-save and drops.
+    // oxlint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
+    <section
+      ref={rootRef}
+      className={windowClass(win, focused)}
+      role="dialog"
+      aria-labelledby={titleId}
+      data-testid="compose-window"
+      onKeyDown={onKeyDown}
+      onPointerDownCapture={focusWindow}
+      onBlur={(e) => {
+        if (!rootRef.current?.contains(e.relatedTarget as Node | null)) saver.saveSoon();
+      }}
+      onDragEnter={onDragEnter}
+      onDragOver={(e) => {
+        if (dragging) e.preventDefault();
+      }}
+    >
+      <TitleBar win={win} titleId={titleId} title={title} onClose={() => void handleClose()} busy={closing} />
+
+      <div className="cw-body" hidden={win.minimized}>
+        <div className="cw-fields">
+          <IdentitySelect
+            identities={me.identities}
+            value={fields.fromAddressId}
+            onChange={(id) => update({ fromAddressId: id })}
+            disabled={busy}
+          />
+          <RecipientField
+            ref={toRef}
+            label={t('compose.to')}
+            value={fields.to}
+            onChange={(to) => update({ to })}
+            flagged={flagged}
+            autoFocus={seed.focus === 'to' && !win.minimized}
+            disabled={busy}
+            trailing={
+              <span className="cw-ccbcc">
+                {!showCc && (
+                  <button type="button" onClick={() => setShowCc(true)} aria-label={t('compose.addCc')}>
+                    {t('compose.cc')}
+                  </button>
+                )}
+                {!showBcc && (
+                  <button type="button" onClick={() => setShowBcc(true)} aria-label={t('compose.addBcc')}>
+                    {t('compose.bcc')}
+                  </button>
+                )}
+              </span>
+            }
+          />
+          {showCc && (
+            <RecipientField ref={ccRef} label={t('compose.cc')} value={fields.cc} onChange={(cc) => update({ cc })} flagged={flagged} disabled={busy} />
+          )}
+          {showBcc && (
+            <RecipientField
+              ref={bccRef}
+              label={t('compose.bcc')}
+              value={fields.bcc}
+              onChange={(bcc) => update({ bcc })}
+              flagged={flagged}
+              disabled={busy}
+            />
+          )}
+          <div className="cw-field">
+            <input
+              className="cw-subject"
+              aria-label={t('compose.subject')}
+              placeholder={t('compose.subject')}
+              value={fields.subject}
+              disabled={busy}
+              maxLength={998}
+              onChange={(e) => update({ subject: e.target.value })}
+            />
+          </div>
+        </div>
+
+        <div className="cw-scroll">
+          <EditorSurface editor={editor} />
+          {fields.quotedHtml && !isBlankHtml(fields.quotedHtml) && (
+            <QuotedToggle
+              html={fields.quotedHtml}
+              expanded={quoteOpen}
+              onToggle={() => setQuoteOpen((o) => !o)}
+              onRemove={() => {
+                setQuoteOpen(false);
+                update({ quotedHtml: null });
+              }}
+              allowRemote={me.settings.remote_images === 'always'}
+              filesOrigins={filesOrigins}
+            />
+          )}
+          <AttachmentBar
+            attachments={regularAttachments}
+            uploads={uploads}
+            onRemove={removeAttachment}
+            onCancelUpload={(id) => queue.cancel(id)}
+            disabled={busy}
+          />
+        </div>
+
+        {showFormatting && <EditorToolbar editor={editor} className="cw-format-bar" />}
+
+        <footer className="cw-actions">
+          <SendButton
+            onSend={() => void handleSend()}
+            onSchedule={() => setScheduleOpen(true)}
+            disabled={uploadsPending || closing}
+            disabledReason={uploadsPending ? t('compose.sendDisabledUploading') : undefined}
+            sending={sending}
+          />
+          <div className="cw-action-icons">
+            <IconButton
+              icon="format_color_text"
+              label={t('compose.formatting')}
+              size="sm"
+              tooltipSide="top"
+              active={showFormatting}
+              onClick={() => {
+                setShowFormatting((v) => {
+                  writeFormattingPref(!v);
+                  return !v;
+                });
+              }}
+            />
+            <IconButton icon="attach_file" label={t('compose.attach')} size="sm" tooltipSide="top" disabled={busy} onClick={() => attachInputRef.current?.click()} />
+            <IconButton icon="link" label={t('compose.insertLink')} size="sm" tooltipSide="top" disabled={busy} onClick={() => setLinkOpen(true)} />
+            <IconButton icon="photo" label={t('compose.insertPhoto')} size="sm" tooltipSide="top" disabled={busy} onClick={() => photoInputRef.current?.click()} />
+            <SignatureMenu editor={editor} signatureHtml={me.settings.signature_html} disabled={busy} onManage={() => void navigate('/settings/general')} />
+          </div>
+          <span className="cw-save-state" aria-live="polite">
+            {saveText}
+          </span>
+          <IconButton icon="delete" label={t('compose.discard')} size="sm" tooltipSide="top" disabled={sending} onClick={() => void handleDiscard()} />
+        </footer>
+
+        {dragging && (
+          <div
+            className="cw-drop"
+            onDragOver={(e) => {
+              e.preventDefault();
+              e.dataTransfer.dropEffect = 'copy';
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragging(false);
+              addFiles(filesFromTransfer(e.dataTransfer), 'drop');
+            }}
+          >
+            <span className="cw-drop-title">{t('compose.dropHere')}</span>
+            <span className="cw-drop-hint">{t('compose.dropHint')}</span>
+          </div>
+        )}
+      </div>
+
+      <input
+        ref={attachInputRef}
+        type="file"
+        multiple
+        hidden
+        data-testid="compose-attach-input"
+        onChange={(e) => {
+          addFiles(Array.from(e.target.files ?? []), 'attach');
+          e.target.value = '';
+        }}
+      />
+      <input
+        ref={photoInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        hidden
+        data-testid="compose-photo-input"
+        onChange={(e) => {
+          addFiles(Array.from(e.target.files ?? []), 'photo');
+          e.target.value = '';
+        }}
+      />
+
+      <SchedulePicker open={scheduleOpen} onOpenChange={setScheduleOpen} timeZone={tz} onSchedule={(at) => void handleSend(at)} />
+      <LinkDialog editor={editor} open={linkOpen} onOpenChange={setLinkOpen} />
+
+      <Dialog
+        open={alert !== null}
+        onOpenChange={(o) => !o && setAlert(null)}
+        title={alert?.title ?? ''}
+        size="sm"
+        showClose={false}
+        description={
+          alert && (
+            <div className="flex flex-col gap-1">
+              {alert.lines.map((l, i) => (
+                <p key={i}>{l}</p>
+              ))}
+            </div>
+          )
+        }
+        footer={
+          <Button onClick={() => setAlert(null)} autoFocus>
+            {t('compose.errors.ok')}
+          </Button>
+        }
+      />
+
+      <ConfirmDialog
+        open={confirmSubject !== null}
+        onOpenChange={(o) => !o && setConfirmSubject(null)}
+        title={t('compose.emptySubject.title')}
+        confirmLabel={t('compose.emptySubject.confirm')}
+        onConfirm={() => {
+          const at = confirmSubject?.scheduledAt ?? null;
+          setConfirmSubject(null);
+          void handleSend(at, true);
+        }}
+      />
+
+      <Dialog
+        open={conflict !== null}
+        onOpenChange={() => {
+          /* must choose */
+        }}
+        dismissible={false}
+        showClose={false}
+        title={t('compose.conflict.title')}
+        description={t('compose.conflict.message')}
+        size="sm"
+        footer={
+          <>
+            <Button variant="text" onClick={() => void overwriteServer()} disabled={conflictBusy}>
+              {t('compose.conflict.overwrite')}
+            </Button>
+            <Button onClick={() => void reloadFromServer()} loading={conflictBusy} autoFocus>
+              {t('compose.conflict.reload')}
+            </Button>
+          </>
+        }
+      />
+
+      <ConfirmDialog
+        open={closeFailed !== null}
+        onOpenChange={(o) => !o && setCloseFailed(null)}
+        title={t('compose.closeFailed.title')}
+        message={t('compose.closeFailed.message', { reason: closeFailed ?? '' })}
+        confirmLabel={t('compose.closeFailed.confirm')}
+        cancelLabel={t('compose.closeFailed.cancel')}
+        danger
+        onConfirm={() => {
+          setCloseFailed(null);
+          finishClose();
+        }}
+      />
+    </section>
+  );
+}
+
+// ───────────── signature menu ─────────────
+
+function SignatureMenu({
+  editor,
+  signatureHtml,
+  disabled,
+  onManage,
+}: {
+  editor: Editor | null;
+  signatureHtml: string;
+  disabled?: boolean;
+  onManage: () => void;
+}) {
+  const present = useEditorState({ editor, selector: ({ editor: e }) => hasSignature(e) }) ?? false;
+  const blank = isBlankHtml(signatureHtml);
+  return (
+    <DropdownMenu
+      side="top"
+      aria-label={t('compose.signature')}
+      trigger={<IconButton icon="signature" label={t('compose.signature')} size="sm" tooltipSide="top" disabled={disabled || !editor} />}
+      items={[
+        {
+          key: 'none',
+          label: t('compose.signatureMenu.none'),
+          icon: present ? undefined : 'check',
+          onSelect: () => editor?.chain().focus().removeSignature().run(),
+        },
+        {
+          key: 'insert',
+          label: blank ? t('compose.signatureMenu.empty') : t('compose.signatureMenu.insert'),
+          icon: present ? 'check' : undefined,
+          disabled: blank,
+          onSelect: () => editor?.chain().focus().setSignature(signatureHtml).run(),
+        },
+        { key: 'sep', type: 'separator' },
+        { key: 'manage', label: t('compose.signatureMenu.manage'), icon: 'settings', onSelect: onManage },
+      ]}
+    />
+  );
+}
