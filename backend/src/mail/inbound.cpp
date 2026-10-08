@@ -103,10 +103,16 @@ std::string clean_filename(std::string_view raw) {
   return out.empty() ? "attachment" : out;
 }
 
+// Always valid UTF-8: a stored JSON column must stay parseable whatever the sender put in its
+// headers (review R1).
 json::array strings_json(const std::vector<std::string>& v) {
   json::array a;
-  for (const auto& s : v) a.emplace_back(json::string(s));
+  for (const auto& s : v) a.emplace_back(json::string(utf8_sanitize(s)));
   return a;
+}
+
+json::value opt_json_string(const std::optional<std::string>& v) {
+  return v ? json::value(json::string(utf8_sanitize(*v))) : json::value();
 }
 
 // The outbound a loopback copy belongs to, with the identity it was sent from.
@@ -127,6 +133,47 @@ std::optional<LoopOutbound> find_loop_outbound(db::Conn& c, std::string_view whe
   // visible to every recipient, so they alone must not mark forged mail as our own.
   if (normalize_email(s.text(3)) != normalize_email(from_email)) return std::nullopt;
   return LoopOutbound{s.i64(0), s.i64(1), s.opt_text(2)};
+}
+
+// Review R7/SEC-3: X-AzMail-Ref (and the From it was sent with) is visible to every recipient
+// of our mail, so a matching ref alone proves nothing. It vouches for the mail being our own
+// loopback — clearing spoofed_internal — only when every local envelope recipient was a
+// recipient of that send (its frozen To/Cc/Bcc) and, once the send's Message-ID is known, the
+// mail carries exactly that id.
+bool ref_verified(db::Conn& c, const LoopOutbound& o, const std::vector<std::string>& envelope,
+                  const std::optional<std::string>& msgid) {
+  if (o.message_id && (!msgid || *msgid != *o.message_id)) return false;
+  const auto payload = c.scalar<std::string>("SELECT payload_json FROM outbound WHERE id = ?", o.id);
+  if (!payload) return false;
+  std::set<std::string> rcpts;
+  try {
+    const detail::FrozenPayload p = detail::payload_from_json(*payload);
+    for (const auto* list : {&p.to, &p.cc, &p.bcc})
+      for (const auto& formatted : *list)
+        if (auto a = azm::parse_address(formatted)) rcpts.insert(normalize_email(a->email, true));
+  } catch (const detail::PayloadCorrupt&) {
+    return false;
+  }
+  bool any_local = false;
+  for (const auto& e : envelope) {
+    if (!detail::is_local_domain(c, e)) continue;
+    any_local = true;
+    if (!rcpts.contains(normalize_email(e, true))) return false;
+  }
+  return any_local;
+}
+
+// DKIM or DMARC passed (and DMARC did not fail): the mail was really sent by its From domain.
+bool authenticated(const AuthResults& auth) {
+  const std::string dkim = lower_trim(auth.dkim), dmarc = lower_trim(auth.dmarc);
+  return (dkim == "pass" || dmarc == "pass") && dmarc != "fail";
+}
+
+std::optional<std::string> clean_msgid(const std::optional<std::string>& raw) {
+  if (!raw) return std::nullopt;
+  std::string id = sanitize_message_id(*raw);
+  if (id.empty()) return std::nullopt;
+  return id;
 }
 
 }  // namespace
@@ -233,32 +280,32 @@ DeliveryResult deliver_inbound(db::Tx& tx, const InboundEmail& email, const Deli
   if (email.raw) register_blob(tx, *email.raw, now);
   for (const auto& a : email.attachments) register_blob(tx, a.blob, now);
 
-  std::vector<std::string> refs;  // In-Reply-To + References, normalized, deduplicated
+  // Message-IDs come from the sender (raw header bytes, or Resend's JSON): every one that is
+  // stored, looked up or sent back later passes sanitize_message_id — whatever the producer of
+  // the InboundEmail did (review R1/SEC-8).
+  std::vector<std::string> refs;  // In-Reply-To + References, sanitized, deduplicated
   {
     std::set<std::string> seen;
     auto add = [&](const std::string& r) {
-      std::string id = normalize_message_id(r);
+      std::string id = sanitize_message_id(r);
       if (!id.empty() && seen.insert(id).second) refs.push_back(std::move(id));
     };
     for (const auto& r : email.references) add(r);
     if (email.in_reply_to) add(*email.in_reply_to);
   }
-  std::optional<std::string> msgid;
-  if (email.message_id) {
-    std::string id = normalize_message_id(*email.message_id);
-    if (!id.empty()) msgid = std::move(id);
-  }
+  const std::optional<std::string> msgid = clean_msgid(email.message_id);
+  const std::optional<std::string> in_reply_to = clean_msgid(email.in_reply_to);
   std::vector<std::string> references;  // header order, for replies' References chains
   for (const auto& r : email.references)
-    if (std::string id = normalize_message_id(r); !id.empty()) references.push_back(std::move(id));
+    if (std::string id = sanitize_message_id(r); !id.empty()) references.push_back(std::move(id));
 
   {
     json::object meta;
-    meta["in_reply_to"] = email.in_reply_to ? json::value(normalize_message_id(*email.in_reply_to)) : json::value();
+    meta["in_reply_to"] = in_reply_to ? json::value(*in_reply_to) : json::value();
     meta["references"] = strings_json(references);
-    meta["x_azmail_ref"] = email.x_azmail_ref ? json::value(*email.x_azmail_ref) : json::value();
-    meta["auto_submitted"] = email.auto_submitted ? json::value(*email.auto_submitted) : json::value();
-    meta["html_format"] = email.html_format;
+    meta["x_azmail_ref"] = opt_json_string(email.x_azmail_ref);
+    meta["auto_submitted"] = opt_json_string(email.auto_submitted);
+    meta["html_format"] = utf8_sanitize(email.html_format);
     meta["attachments"] = static_cast<int64_t>(email.attachments.size());
     tx.run(
         "UPDATE inbound_emails SET message_id_header = ?, from_email = ?, subject = ?, received_at = ?, "
@@ -304,7 +351,13 @@ DeliveryResult deliver_inbound(db::Tx& tx, const InboundEmail& email, const Deli
   std::optional<LoopOutbound> by_ref;
   if (email.x_azmail_ref && !trim(*email.x_azmail_ref).empty())
     by_ref = find_loop_outbound(c, "uuid", trim(*email.x_azmail_ref), email.from.email);
-  if (by_ref && !by_ref->message_id && msgid) {  // capture source (c) of B2
+  // The ref chooses the loopback-merge path below (a forged ref can only flag an existing copy
+  // of the send as received); it clears spoofed_internal only when verified (R7/SEC-3).
+  const bool ref_ok = by_ref && ref_verified(c, *by_ref, envelope, msgid);
+  // Capture source (c) of B2 only from mail that is provably ours: verified ref AND DKIM/DMARC
+  // pass — a forged mail must never decide our Message-ID (and with it which messages the late
+  // loopback cleanup folds away).
+  if (by_ref && !by_ref->message_id && msgid && ref_ok && authenticated(email.auth)) {
     set_outbound_message_id(tx, by_ref->id, *msgid);
     by_ref->message_id = msgid;
   }
@@ -312,7 +365,7 @@ DeliveryResult deliver_inbound(db::Tx& tx, const InboundEmail& email, const Deli
   if (!loop && msgid) loop = find_loop_outbound(c, "message_id_header", *msgid, email.from.email);
 
   const std::vector<std::string> warnings =
-      spam_warnings(email.auth, detail::is_local_domain(c, email.from.email), by_ref.has_value());
+      spam_warnings(email.auth, detail::is_local_domain(c, email.from.email), ref_ok);
   const bool is_spam = !warnings.empty();
   const std::string warnings_json = json::serialize(strings_json(warnings));
 
@@ -343,8 +396,8 @@ DeliveryResult deliver_inbound(db::Tx& tx, const InboundEmail& email, const Deli
   for (const auto& a : email.attachments) {
     AttRow r{&a, clean_filename(a.filename), detail::normalize_mime(a.content_type), std::nullopt, false};
     if (r.content_type.empty()) r.content_type = "application/octet-stream";
-    if (a.content_id) {
-      std::string cid = normalize_message_id(*a.content_id);
+    if (a.content_id) {  // a Content-ID is forwarded to Resend later: header-safe only (SEC-8)
+      std::string cid = sanitize_message_id(*a.content_id);
       if (!cid.empty()) r.content_id = std::move(cid);
     }
     // Inline = a part the HTML can reference: Content-ID plus inline disposition, or a cid: use.
@@ -359,12 +412,20 @@ DeliveryResult deliver_inbound(db::Tx& tx, const InboundEmail& email, const Deli
     const int64_t owner = rcpt.user_id;
     if (loop) {
       auto s = c.prepare(
-          "SELECT id, thread_id FROM messages WHERE outbound_id = ? AND owner_id = ? AND direction = 'out' AND "
-          "is_draft = 0 ORDER BY is_shared_copy, id LIMIT 1");
+          "SELECT id, thread_id, delivered_to FROM messages WHERE outbound_id = ? AND owner_id = ? AND "
+          "direction = 'out' AND is_draft = 0 ORDER BY is_shared_copy, id LIMIT 1");
       s.bind_all(loop->id, owner);
       if (s.step()) {
         const int64_t mid = s.i64(0), thread = s.i64(1);
+        const bool merged_before = s.opt_text(2).has_value();
         s.reset();
+        if (merged_before) {
+          // Another part of a split delivery already merged into this copy (sender and shared
+          // copies are created with delivered_to NULL): it must not come back unread or as new
+          // mail (review R11).
+          res.copies.push_back({owner, mid, thread, rcpt.delivered_to, true, false, true});
+          continue;
+        }
         // The owner already holds our outbound copy: it lands in the inbox instead of a duplicate.
         const bool not_sender = owner != loop->sender;
         tx.run(
@@ -411,9 +472,7 @@ DeliveryResult deliver_inbound(db::Tx& tx, const InboundEmail& email, const Deli
         "VALUES(?, ?, 'in', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
         owner, thread, res.inbound_id, email.from.name, email.from.email, detail::addresses_to_json(email.to),
         detail::addresses_to_json(email.cc), bcc_json, detail::addresses_to_json(email.reply_to), rcpt.delivered_to,
-        subject, snippet, date, msgid,
-        email.in_reply_to ? std::optional<std::string>(normalize_message_id(*email.in_reply_to)) : std::nullopt,
-        has_attachments, size_bytes, !is_spam, is_spam, email.auth.spf, email.auth.dkim, email.auth.dmarc,
+        subject, snippet, date, msgid, in_reply_to, has_attachments, size_bytes, !is_spam, is_spam, email.auth.spf, email.auth.dkim, email.auth.dmarc,
         warnings_json, now, now);
     if (tx.changes() == 0) {
       // Split delivery / re-run (UNIQUE(owner, inbound_id), messages_in_msgid): drop the thread

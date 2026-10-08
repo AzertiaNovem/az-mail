@@ -15,6 +15,7 @@
 
 #include "core/address.hpp"
 #include "core/blob_store.hpp"
+#include "core/strings.hpp"
 #include "db/sqlite.hpp"
 
 #include <boost/json/object.hpp>
@@ -291,6 +292,23 @@ inline std::string normalize_message_id(std::string_view raw) {
   return std::string(raw.substr(b, e - b));
 }
 
+// (additive, review R1/SEC-8) normalize_message_id plus the checks every stored or sent
+// Message-ID / Content-ID must pass: invalid UTF-8 is replaced (utf8_sanitize, the rule
+// threads_for_refs also applies to lookups), and the result is "" (= no id) when the value is
+// longer than 998 bytes or contains whitespace, a control character (< 0x21, 0x7f) or one of
+// < > " \ — such a value cannot be sent back in an In-Reply-To / References / Content-ID header
+// safely, and stored ids must never make the JSON they end up in unparseable.
+inline constexpr std::size_t kMaxMessageIdBytes = 998;
+inline std::string sanitize_message_id(std::string_view raw) {
+  std::string id = utf8_sanitize(normalize_message_id(raw));
+  if (id.size() > kMaxMessageIdBytes) return {};
+  for (const char ch : id) {
+    const auto u = static_cast<unsigned char>(ch);
+    if (u < 0x21 || u == 0x7f || ch == '<' || ch == '>' || ch == '"' || ch == '\\') return {};
+  }
+  return id;
+}
+
 // =============================================================================================
 // Thread list (GET /api/threads → ThreadListResponse)
 // =============================================================================================
@@ -335,6 +353,11 @@ struct ThreadListItem {
   std::optional<OutboundStatus> latest_status;  // status of the latest outbound message, if any
   std::optional<int64_t> scheduled_at;    // earliest pending scheduled_at in the thread
   std::vector<AttachmentPreview> attachments_preview;
+  // Additive (F16): To + Cc — never Bcc — (deduplicated, max 3, is_me marked; `unread` unused)
+  // of the newest sent / scheduled (direction 'out', non-draft) message of the view — the Sent /
+  // Scheduled rows show "收件人：…" like Gmail instead of the sender ("我"). Empty when the view
+  // has none; then the wire field `to_preview` is omitted.
+  std::vector<Participant> to_preview;
 };
 
 struct ThreadPage {  // ThreadListResponse
@@ -508,7 +531,7 @@ struct OutboundSendPlan {
   std::string from;                   // formatted "Name <addr>" (format_address)
   std::vector<std::string> to, cc, bcc, reply_to;  // formatted addresses
   std::string subject;
-  std::string html;                   // frozen: body + signature + quoted_html, cid: kept
+  std::string html;                   // frozen: body (signature inserted by the client) + quoted_html, cid: kept
   std::string text;                   // html_to_text(html)
   std::vector<std::pair<std::string, std::string>> headers;  // X-AzMail-Ref, In-Reply-To, References
   std::vector<std::pair<std::string, std::string>> tags;     // {azmail_outbound, uuid}
@@ -521,6 +544,11 @@ struct OutboundSendPlan {
   bool parent_message_id_missing = false;
   std::optional<int64_t> parent_outbound_id;
   std::optional<std::string> parent_resend_id;  // GET /emails/{id} to capture it
+  // (additive, review RT-3/R6) In-Reply-To/References were fixed in payload_json before the
+  // first POST (mail::freeze_send_headers): every attempt under the same Idempotency-Key sends
+  // exactly these headers and no parent lookup happens any more (parent_message_id_missing is
+  // then false).
+  bool headers_frozen = false;
 };
 
 // A delivery event from a webhook, the reconcile poller or a local transition.

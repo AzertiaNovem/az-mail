@@ -388,11 +388,14 @@ bool recompute_thread(db::Tx& tx, int64_t owner, int64_t thread_id) {
     pj.emplace_back(std::move(o));
   }
 
-  // Non-inline attachments of non-draft messages.
+  // Non-inline attachments of the normal set (non-draft, not trashed, not spam), like every other
+  // per-view field: a trashed or spam message's attachment must not put a paperclip on the
+  // Inbox / Sent row whose attachments_preview is empty (review R12).
   const int64_t attachment_count =
       tx.scalar<int64_t>(
             "SELECT COUNT(*) FROM attachments a JOIN messages m ON m.id = a.message_id "
-            "WHERE m.thread_id = ? AND m.owner_id = ? AND m.is_draft = 0 AND a.is_inline = 0",
+            "WHERE m.thread_id = ? AND m.owner_id = ? AND m.is_draft = 0 AND m.trashed_at IS NULL AND "
+            "m.is_spam = 0 AND a.is_inline = 0",
             thread_id, owner)
           .value_or(0);
 

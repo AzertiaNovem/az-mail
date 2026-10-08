@@ -10,6 +10,7 @@
 
 #include <iconv.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <fstream>
 #include <stdexcept>
@@ -150,8 +151,15 @@ std::optional<EncodedWord> parse_encoded_word(std::string_view s, std::size_t po
   const char enc = static_cast<char>(s[q1 + 1] | 0x20);
   if (enc != 'b' && enc != 'q') return std::nullopt;
   const std::size_t text_begin = q1 + 3;
-  const std::size_t close = s.find("?=", text_begin);
-  if (close == std::string_view::npos) return std::nullopt;
+  // The terminating "?=" is searched for within a bounded window only: RFC 2047 §2 caps an
+  // encoded-word at 75 characters, and an unbounded search scanned to the end of the value for
+  // every unterminated "=?" (quadratic over a 512 KiB header block, review SEC-5). The window
+  // is lenient (broken encoders write longer words, or a raw '?' inside Q text).
+  constexpr std::size_t kMaxEncodedText = 256;
+  const std::string_view window = s.substr(text_begin, std::min(kMaxEncodedText, s.size() - text_begin));
+  const std::size_t rel = window.find("?=");
+  if (rel == std::string_view::npos) return std::nullopt;
+  const std::size_t close = text_begin + rel;
   std::string_view charset = s.substr(pos + 2, q1 - (pos + 2));
   for (char c : charset)
     if (is_space(c)) return std::nullopt;
@@ -395,7 +403,9 @@ std::vector<std::string> parse_msgid_list(std::string_view value) {
   std::vector<std::string> out;
   std::unordered_set<std::string> seen;
   auto add = [&](std::string_view raw) {
-    std::string id = normalize_message_id(remove_spaces(raw));
+    // Raw header bytes: invalid UTF-8, control characters or specials must never reach the
+    // database or a reply's In-Reply-To/References (review R1/SEC-8).
+    std::string id = sanitize_message_id(remove_spaces(raw));
     if (id.empty() || !seen.insert(id).second) return;
     out.push_back(std::move(id));
   };
@@ -442,11 +452,23 @@ std::optional<std::string> parse_msgid(std::string_view value) {
 
 namespace {
 
+// Header values we decode are capped (review SEC-5): no legitimate Subject / From / Reply-To is
+// anywhere near this, and decoding (iconv per charset run) stays cheap for a crafted 512 KiB
+// header block. Cut at whitespace so an encoded-word or multi-byte character is not split.
+constexpr std::size_t kMaxDecodedHeaderBytes = 64u << 10;
+
+std::string_view capped(std::string_view v) {
+  if (v.size() <= kMaxDecodedHeaderBytes) return v;
+  const std::size_t ws = v.find_last_of(" \t", kMaxDecodedHeaderBytes);
+  if (ws != std::string_view::npos && ws > kMaxDecodedHeaderBytes / 2) return v.substr(0, ws);
+  return v.substr(0, kMaxDecodedHeaderBytes);
+}
+
 std::vector<Address> decoded_addresses(const std::optional<std::string>& raw) {
   if (!raw) return {};
   // Parse the RAW value first (encoded-words are atoms / quoted text), then decode names, so
   // decoded specials (",", "<") in a display name cannot break the list.
-  std::vector<Address> list = parse_address_list(unfold(*raw));
+  std::vector<Address> list = parse_address_list(unfold(capped(*raw)));
   for (auto& a : list) {
     a.name = std::string(trim(decode_rfc2047(a.name)));
     a.email = raw_to_utf8(a.email);
@@ -480,7 +502,7 @@ ParsedHeaders extract_headers(const HeaderBlock& block) {
     if (!t.empty()) out.auto_submitted = std::move(t);
   }
   if (auto v = block.get("Date")) out.date_ms = parse_rfc5322_date(trim(unfold(*v)));
-  if (auto v = block.get("Subject")) out.subject = std::string(trim(decode_rfc2047(*v)));
+  if (auto v = block.get("Subject")) out.subject = std::string(trim(decode_rfc2047(capped(*v))));
   out.from = decoded_addresses(block.get("From"));
   out.reply_to = decoded_addresses(block.get("Reply-To"));
   return out;

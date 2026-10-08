@@ -110,9 +110,12 @@ class TextBuilder {
   void flush() {
     if (pending_newlines_ > 0 && !out_.empty()) {
       trim_trailing_spaces();
-      // Count newlines already at the end so explicit ones (pre) are not doubled.
+      // Count newlines already at the end so explicit ones (pre) are not doubled. Only up to
+      // pending_newlines_ matter: counting a long run of <pre> newlines on every flush would be
+      // quadratic (review SEC-1).
       int existing = 0;
-      for (auto it = out_.rbegin(); it != out_.rend() && *it == '\n'; ++it) ++existing;
+      for (auto it = out_.rbegin(); it != out_.rend() && *it == '\n' && existing < pending_newlines_; ++it)
+        ++existing;
       for (int k = existing; k < pending_newlines_; ++k) out_.push_back('\n');
       at_line_start_ = true;
       pending_space_ = false;
@@ -143,14 +146,21 @@ bool is_block_tag(std::string_view n) {
          n == "body" || n == "html" || n == "legend" || n == "option";
 }
 
-// Whether a link's target adds information beyond its visible text.
+// Whether a link's target adds information beyond its visible text. `text` is a view into the
+// builder, never a copy: many nested unclosed <a> around a large text would otherwise copy it
+// once per </a> (quadratic, review SEC-1). Every comparison below is size-checked first
+// (iequals), so a long text costs O(1) here.
 bool link_worth_showing(std::string_view href, std::string_view text) {
   href = trim(href);
-  text = trim(text);
-  if (href.empty() || text.empty()) return false;
+  if (href.empty()) return false;
   if (href[0] == '#' || istarts_with(href, "javascript:") || istarts_with(href, "cid:") ||
       istarts_with(href, "data:"))
     return false;
+  // A text far longer than the target cannot be a spelling of it: decided without scanning the
+  // text (trailing '/' or whitespace runs would otherwise be walked once per </a>).
+  if (text.size() > href.size() + 4096) return true;
+  text = trim(text);
+  if (text.empty()) return false;
   auto same = [&](std::string_view h) {
     while (!h.empty() && h.back() == '/') h.remove_suffix(1);
     std::string_view t = text;
@@ -186,19 +196,19 @@ struct LinkState {
 std::size_t skip_element_content(std::string_view h, std::size_t content_begin,
                                  const std::string& name) {
   if (name == "head") {
-    // Malformed mail often omits </head>: stop at <body as well.
-    const std::size_t close = html::find_close_tag(h, content_begin, "head");
-    std::size_t body = std::string_view::npos;
+    // Malformed mail often omits </head>: stop at <body as well. One forward scan that stops at
+    // whichever comes first — looking for "</head" over the whole rest of the document first
+    // made every unclosed <head> cost O(n) (quadratic for "<head><body>" repeated, review SEC-1).
     for (std::size_t p = h.find('<', content_begin); p != std::string_view::npos;
          p = h.find('<', p + 1)) {
-      if (p >= close) break;
-      if (p + 5 <= h.size() && iequals(h.substr(p + 1, 4), "body")) {
-        body = p;
-        break;
+      if (p + 5 <= h.size() && iequals(h.substr(p + 1, 4), "body")) return p;
+      if (p + 6 <= h.size() && h[p + 1] == '/' && iequals(h.substr(p + 2, 4), "head")) {
+        const std::size_t after = p + 6;
+        const char c = after < h.size() ? h[after] : '>';
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '/' || c == '>') return p;
       }
     }
-    if (body != std::string_view::npos) return body;
-    return close == std::string_view::npos ? h.size() : close;
+    return h.size();
   }
   const std::size_t close = html::find_close_tag(h, content_begin, name);
   return close == std::string_view::npos ? h.size() : close;
@@ -488,8 +498,8 @@ std::string html_to_text(std::string_view input) {
       } else if (!links.empty()) {
         LinkState l = std::move(links.back());
         links.pop_back();
-        const std::string text(b.since(l.text_start));
-        if (link_worth_showing(l.href, text)) b.inline_text(" <" + std::string(trim(l.href)) + ">");
+        // Decided before inline_text appends (the view points into the builder).
+        if (link_worth_showing(l.href, b.since(l.text_start))) b.inline_text(" <" + std::string(trim(l.href)) + ">");
       }
     } else if (is_paragraph_tag(name)) {
       b.paragraph();
@@ -514,7 +524,11 @@ std::string strip_quoted_text(std::string_view text) {
 }
 
 std::string make_snippet(std::string_view body, bool is_html, std::size_t max_chars) {
-  const std::string clean = utf8_sanitize(body);
+  // The snippet is a short prefix: only the start of a huge body matters, and the work done
+  // here (inside write transactions) stays bounded whatever the sender put in (review SEC-1).
+  constexpr std::size_t kMaxSnippetInput = 1u << 20;
+  const std::string clean = utf8_sanitize(body.size() > kMaxSnippetInput ? utf8_truncate(body, kMaxSnippetInput)
+                                                                         : std::string(body));
   const std::string text = is_html ? html_to_text(remove_html_quote_blocks(clean)) : clean;
   std::string snippet = detail::collapse_whitespace(cut_signature(strip_quoted_text(text)));
   if (snippet.empty()) {

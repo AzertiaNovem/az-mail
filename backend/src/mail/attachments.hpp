@@ -50,15 +50,19 @@ std::optional<RawRef> find_raw(db::Conn& c, int64_t owner, int64_t message_id);
 // Deletes unattached uploads created before `older_than_ms` (at most `limit`). Returns count.
 int purge_orphan_uploads(db::Tx& tx, int64_t older_than_ms, int limit);
 
-// Blobs with no attachments row and no inbound_emails.raw_sha256 reference, created before
-// `created_before_ms` (cfg.blob_gc_grace_hours), at most `limit`.
+// Blobs with no attachments row and no live inbound_emails.raw_sha256 reference, created before
+// `created_before_ms` (cfg.blob_gc_grace_hours), at most `limit`. (review R3) A raw .eml is a live
+// reference only while its inbound row is pending/failed or some message still has
+// inbound_id = that row; after the last copy is deleted forever / purged (or the mail was
+// unroutable) it is collected.
 std::vector<BlobRef> unreferenced_blobs(db::Conn& c, int64_t created_before_ms, int limit);
 
-// True when the blobs row exists and nothing references it (no attachments row, no
-// inbound_emails.raw_sha256). gc.blobs re-checks with this under blob_gc_guard().
+// True when the blobs row exists and nothing references it (no attachments row, no live
+// inbound_emails.raw_sha256, see unreferenced_blobs). gc.blobs re-checks with this under blob_gc_guard().
 bool is_blob_unreferenced(db::Conn& c, std::string_view sha256);
 
-// Deletes the blobs row iff it is still unreferenced; true when deleted.
+// Deletes the blobs row iff it is still unreferenced; true when deleted. Finished inbound rows
+// that still name the raw get raw_sha256 = NULL first (their metadata is kept).
 // gc.blobs order per candidate (DESIGN Addendum A "remove() → delete row"), all under one
 // blob_gc_guard() (core/blob_store.hpp) taken for that blob only:
 //   R: is_blob_unreferenced → BlobStore::remove (Services::blobs_for(storage), outside any tx;

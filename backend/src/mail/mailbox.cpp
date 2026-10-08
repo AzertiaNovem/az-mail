@@ -9,6 +9,7 @@
 #include "core/time.hpp"
 #include "mail/attachments.hpp"
 #include "mail/internal.hpp"
+#include "mail/outbound.hpp"
 #include "mail/render.hpp"
 #include "mail/search.hpp"
 #include "mail/threads.hpp"
@@ -175,6 +176,9 @@ void decorate(db::Conn& c, int64_t owner, std::vector<ThreadRow>& rows, Scope sc
       auto& prev = rows[pos.at(s.i64(0))].item.attachments_preview;
       if (prev.size() < 3) prev.push_back({s.i64(1), s.text(2), s.text(3)});
     }
+    // The paperclip follows the view's own messages (review R12): the thread aggregate counts the
+    // normal set only, so Spam / Trash / search rows decide from the scoped preview instead.
+    for (auto& r : rows) r.item.has_attachments = !r.item.attachments_preview.empty();
   }
   {  // status of the latest outbound message
     auto s = c.prepare("SELECT m.thread_id, o.status FROM messages m JOIN outbound o ON o.id = m.outbound_id "
@@ -187,6 +191,32 @@ void decorate(db::Conn& c, int64_t owner, std::vector<ThreadRow>& rows, Scope sc
       const int64_t tid = s.i64(0);
       if (!seen.insert(tid).second) continue;
       rows[pos.at(tid)].item.latest_status = parse_outbound_status(s.text(1));
+    }
+  }
+  {  // recipients of the newest outbound message (Sent / Scheduled rows: "收件人：…", F16). To + Cc
+     // only — never Bcc — of the owner's own out messages in the view (owner-scoped).
+    constexpr std::size_t kMaxToPreview = 3;
+    auto s = c.prepare("SELECT m.thread_id, m.to_json, m.cc_json FROM messages m WHERE m.owner_id = ? AND "
+                       "m.thread_id IN (" + ph + ") AND m.is_draft = 0 AND m.direction = 'out' AND " +
+                       scope_where + " ORDER BY m.thread_id, m.date DESC, m.id DESC");
+    s.bind(1, owner);
+    bind_ids(s, 2);
+    std::set<int64_t> seen;
+    while (s.step()) {
+      const int64_t tid = s.i64(0);
+      if (!seen.insert(tid).second) continue;
+      auto& out = rows[pos.at(tid)].item.to_preview;
+      std::set<std::string> emails;
+      for (const auto& list : {detail::addresses_from_json(s.text(1)), detail::addresses_from_json(s.text(2))}) {
+        for (const auto& a : list) {
+          if (out.size() >= kMaxToPreview) break;
+          if (!emails.insert(normalize_email(a.email)).second) continue;
+          Participant p;
+          p.name = a.name;
+          p.email = a.email;
+          out.push_back(std::move(p));
+        }
+      }
     }
   }
   {  // earliest pending schedule (same rule as scheduled_count)
@@ -228,8 +258,10 @@ void decorate(db::Conn& c, int64_t owner, std::vector<ThreadRow>& rows, Scope sc
 }
 
 void mark_me(std::vector<ThreadRow>& rows, const std::set<std::string>& mine) {
-  for (auto& r : rows)
+  for (auto& r : rows) {
     for (auto& p : r.item.participants) p.is_me = mine.contains(normalize_email(p.email));
+    for (auto& p : r.item.to_preview) p.is_me = mine.contains(normalize_email(p.email));
+  }
 }
 
 // ---- message views ----------------------------------------------------------------------------
@@ -576,6 +608,38 @@ std::optional<int64_t> star_target(db::Tx& tx, int64_t owner, int64_t thread_id)
   return std::nullopt;
 }
 
+// Review R2: the sender's own copies of pending sends in the thread are settled before the copies
+// are trashed or deleted — never may a send go out from a copy the user removed (deleting it
+// would also cascade its attachments away, and nobody could cancel it any more). Queued ones are
+// canceled in this transaction; ones Resend holds (or that are being POSTed) are refused.
+void settle_pending_sends(db::Tx& tx, int64_t owner, int64_t tid, CopyRemoval how, int64_t now) {
+  std::vector<int64_t> copies;
+  {
+    auto s = tx.prepare(
+        std::string("SELECT id FROM messages WHERE thread_id = ? AND owner_id = ? AND is_shared_copy = 0 AND "
+                    "is_draft = 0 AND outbound_id IS NOT NULL AND ") +
+        (how == CopyRemoval::Trash ? "trashed_at IS NULL" : "(trashed_at IS NOT NULL OR is_spam = 1)") +
+        " ORDER BY id");
+    s.bind_all(tid, owner);
+    while (s.step()) copies.push_back(s.i64(0));
+  }
+  for (const int64_t id : copies) {
+    switch (cancel_pending_send(tx, owner, id, how, now)) {
+      case PendingSend::RemoteScheduled:
+        throw ApiError::conflict("scheduled_send_pending", "该邮件已定时发送，请先取消定时再删除",
+                                 {{"thread_id", tid}, {"message_id", id}});
+      case PendingSend::InFlight:
+        if (how == CopyRemoval::Trash)
+          throw ApiError::conflict("scheduled_send_pending", "该定时邮件正在提交，请稍后再试",
+                                   {{"thread_id", tid}, {"message_id", id}});
+        throw ApiError::conflict("send_in_progress", "邮件正在发送，请稍后再删除",
+                                 {{"thread_id", tid}, {"message_id", id}});
+      case PendingSend::None:
+      case PendingSend::Canceled: break;
+    }
+  }
+}
+
 void apply_to_thread(db::Tx& tx, int64_t owner, int64_t tid, ThreadAction action,
                      std::optional<int64_t> label_id, int64_t now) {
   constexpr std::string_view kThread = " WHERE thread_id = ? AND owner_id = ?";
@@ -615,6 +679,7 @@ void apply_to_thread(db::Tx& tx, int64_t owner, int64_t tid, ThreadAction action
       run("is_starred = 0, updated_at = ?" + std::string(kThread) + " AND is_starred = 1", tid, owner);
       break;
     case ThreadAction::Trash:
+      settle_pending_sends(tx, owner, tid, CopyRemoval::Trash, now);
       tx.run("UPDATE messages SET trashed_at = ?, updated_at = ?" + std::string(kThread) +
                  " AND trashed_at IS NULL",
              now, now, tid, owner);
@@ -632,6 +697,7 @@ void apply_to_thread(db::Tx& tx, int64_t owner, int64_t tid, ThreadAction action
           tid, owner);
       break;
     case ThreadAction::DeleteForever:
+      settle_pending_sends(tx, owner, tid, CopyRemoval::Delete, now);
       tx.run("DELETE FROM messages" + std::string(kThread) + " AND (trashed_at IS NOT NULL OR is_spam = 1)", tid,
              owner);
       break;
@@ -770,15 +836,29 @@ PurgeResult purge_trash(db::Tx& tx, int64_t now_ms, int trash_days, int spam_day
   {
     // Negative retention disables that half; 0 purges immediately. Each half is a scan of
     // its partial index (messages_trashed / messages_spam).
+    // The sender's copy of a send Resend holds (scheduled) or that is being POSTed is kept until
+    // that settles (review R2); queued sends are canceled below before their copy goes.
+    constexpr std::string_view kHeld =
+        " AND NOT (is_shared_copy = 0 AND outbound_id IS NOT NULL AND EXISTS (SELECT 1 FROM outbound o WHERE "
+        "o.id = messages.outbound_id AND (o.status = 'sending' OR (o.status IN ('accepted','scheduled') AND "
+        "o.scheduled_via = 'resend' AND o.scheduled_at > ?))))";
     std::vector<std::string> parts;
     std::vector<int64_t> binds;
     if (trash_days >= 0) {
-      parts.emplace_back("SELECT id, owner_id, thread_id FROM messages WHERE trashed_at IS NOT NULL AND trashed_at <= ?");
+      parts.emplace_back("SELECT id, owner_id, thread_id FROM messages WHERE trashed_at IS NOT NULL AND trashed_at <= ?" +
+                         std::string(kHeld));
       binds.push_back(now_ms - trash_days * kDay);
+      binds.push_back(now_ms);
     }
     if (spam_days >= 0) {
-      parts.emplace_back("SELECT id, owner_id, thread_id FROM messages WHERE is_spam = 1 AND date <= ?");
+      // Spam retention counts from when the copy became spam, not from its (sender-controlled,
+      // possibly old) Date header (review R5): delivered as spam → created_at; reported as spam
+      // → the Spam action bumped updated_at. Both only ever lengthen retention.
+      parts.emplace_back(
+          "SELECT id, owner_id, thread_id FROM messages WHERE is_spam = 1 AND MAX(date, created_at, updated_at) <= ?" +
+          std::string(kHeld));
       binds.push_back(now_ms - spam_days * kDay);
+      binds.push_back(now_ms);
     }
     if (parts.empty()) return res;
     std::string sql = join(parts, " UNION ") + " ORDER BY 1 LIMIT ?";
@@ -794,6 +874,10 @@ PurgeResult purge_trash(db::Tx& tx, int64_t now_ms, int trash_days, int spam_day
   }
   std::map<int64_t, std::set<int64_t>> threads_by_owner;
   for (const auto& v : victims) {
+    // A queued send of this (sender) copy is canceled first: it must not go out without its copy
+    // and attachments (review R2).
+    const PendingSend pending = cancel_pending_send(tx, v.owner, v.id, CopyRemoval::Delete, now_ms);
+    if (pending == PendingSend::RemoteScheduled || pending == PendingSend::InFlight) continue;
     tx.run("DELETE FROM messages WHERE id = ?", v.id);
     threads_by_owner[v.owner].insert(v.thread);
     ++res.messages_deleted;

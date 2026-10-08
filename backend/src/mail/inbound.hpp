@@ -48,11 +48,21 @@ std::vector<std::string> unknown_local_recipients(db::Conn& c, std::span<const s
 //    tx.emit(owner, mail.new, ws::mail_new_payload(...));
 //  * inbound_emails.state = 'delivered'.
 // A re-run after full delivery returns State::Duplicate without changes.
+// (review R1/SEC-8) Every Message-ID / In-Reply-To / References / Content-ID is passed through
+// sanitize_message_id before it is stored (messages, message_refs, attachments, meta_json), and
+// every JSON column is written as valid UTF-8.
+// (review R7/SEC-3) A matching X-AzMail-Ref still selects the loopback merge, but it only counts
+// as "ours" for spam_warnings when verified — every local envelope recipient is a recipient of
+// that send (frozen To/Cc/Bcc) and, once the send's Message-ID is known, the mail carries it —
+// and capture source (c) additionally needs DKIM or DMARC "pass" (and no DMARC "fail").
+// (review R11) A loopback part whose owner's copy was already merged by an earlier part
+// (delivered_to set) changes nothing: no unread flip, no second mail.new.
 DeliveryResult deliver_inbound(db::Tx& tx, const InboundEmail& email, const DeliveryOptions& opts = {});
 
 // Pure spoofing rules (C11). Returns warnings: kWarnDmarcFail when auth.dmarc == "fail";
 // kWarnSpoofedInternal when `from_is_local` and neither DKIM nor DMARC is "pass" and
-// `azmail_ref_matches` is false. Any warning ⇒ the copy is delivered as spam.
+// `azmail_ref_matches` (a VERIFIED ref, see deliver_inbound) is false. Any warning ⇒ the copy
+// is delivered as spam.
 std::vector<std::string> spam_warnings(const AuthResults& auth, bool from_is_local, bool azmail_ref_matches);
 
 // Creates the inbound_emails row in state 'pending' if absent (webhook / poller, before

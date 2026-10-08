@@ -31,26 +31,39 @@ constexpr std::size_t kMaxReferences = 20;
 json::array strings_json(const std::vector<std::string>& v) {
   json::array a;
   a.reserve(v.size());
-  for (const auto& s : v) a.emplace_back(json::string(s));
+  for (const auto& s : v) a.emplace_back(json::string(utf8_sanitize(s)));
   return a;
 }
 
+// Strings read back are sanitized: rows frozen before payload_to_json sanitized everything may
+// hold invalid UTF-8 (parsed with allow_invalid_utf8).
 std::vector<std::string> strings_of(const json::object& o, std::string_view key) {
   std::vector<std::string> out;
   if (const auto* v = o.if_contains(key); v && v->is_array())
     for (const auto& el : v->as_array())
-      if (el.is_string()) out.emplace_back(el.as_string());
+      if (el.is_string()) out.push_back(utf8_sanitize(el.as_string()));
   return out;
 }
 
 std::string string_of(const json::object& o, std::string_view key) {
-  if (const auto* v = o.if_contains(key); v && v->is_string()) return std::string(v->as_string());
+  if (const auto* v = o.if_contains(key); v && v->is_string()) return utf8_sanitize(v->as_string());
   return {};
 }
 
 std::optional<std::string> opt_string_of(const json::object& o, std::string_view key) {
-  if (const auto* v = o.if_contains(key); v && v->is_string()) return std::string(v->as_string());
+  if (const auto* v = o.if_contains(key); v && v->is_string()) return utf8_sanitize(v->as_string());
   return std::nullopt;
+}
+
+json::value opt_json(const std::optional<std::string>& v) {
+  return v ? json::value(json::string(utf8_sanitize(*v))) : json::value(nullptr);
+}
+
+std::optional<std::string> clean_id(const std::optional<std::string>& raw) {
+  if (!raw) return std::nullopt;
+  std::string id = sanitize_message_id(*raw);
+  if (id.empty()) return std::nullopt;
+  return id;
 }
 
 std::optional<int64_t> opt_int_of(const json::object& o, std::string_view key) {
@@ -69,35 +82,42 @@ std::optional<int64_t> opt_int_of(const json::object& o, std::string_view key) {
 std::string payload_to_json(const FrozenPayload& p) {
   json::object o;
   o["v"] = 1;
-  o["from"] = p.from;
+  o["from"] = utf8_sanitize(p.from);
   o["to"] = strings_json(p.to);
   o["cc"] = strings_json(p.cc);
   o["bcc"] = strings_json(p.bcc);
   o["reply_to"] = strings_json(p.reply_to);
-  o["subject"] = p.subject;
-  o["html"] = p.html;
-  o["text"] = p.text;
+  o["subject"] = utf8_sanitize(p.subject);
+  o["html"] = utf8_sanitize(p.html);
+  o["text"] = utf8_sanitize(p.text);
   json::array ids;
   for (int64_t id : p.attachment_ids) ids.emplace_back(id);
   o["attachment_ids"] = std::move(ids);
   if (p.parent_message_id) o["parent_message_id"] = *p.parent_message_id;
   else o["parent_message_id"] = nullptr;
-  if (p.in_reply_to) o["in_reply_to"] = *p.in_reply_to;
-  else o["in_reply_to"] = nullptr;
+  o["in_reply_to"] = opt_json(p.in_reply_to);
   o["references"] = strings_json(p.references);
   json::object d;
-  d["html"] = p.draft_html;
-  if (p.draft_quoted_html) d["quoted_html"] = *p.draft_quoted_html;
-  else d["quoted_html"] = nullptr;
+  d["html"] = utf8_sanitize(p.draft_html);
+  d["quoted_html"] = opt_json(p.draft_quoted_html);
   o["draft"] = std::move(d);
+  if (p.headers_frozen) {
+    json::object w;
+    w["in_reply_to"] = opt_json(p.wire_in_reply_to);
+    w["references"] = strings_json(p.wire_references);
+    o["wire"] = std::move(w);
+  }
   return json::serialize(o);
 }
 
 FrozenPayload payload_from_json(std::string_view text) {
   FrozenPayload p;
   boost::system::error_code ec;
-  const json::value v = json::parse(text, ec);
-  if (ec || !v.is_object()) return p;
+  json::parse_options opts;
+  opts.allow_invalid_utf8 = true;  // rows frozen before the sanitizing writer (review R1)
+  const json::value v = json::parse(text, ec, {}, opts);
+  if (ec) throw PayloadCorrupt("outbound payload_json is not valid JSON: " + ec.message());
+  if (!v.is_object()) throw PayloadCorrupt("outbound payload_json is not a JSON object");
   const json::object& o = v.as_object();
   p.from = string_of(o, "from");
   p.to = strings_of(o, "to");
@@ -116,8 +136,17 @@ FrozenPayload payload_from_json(std::string_view text) {
   p.in_reply_to = opt_string_of(o, "in_reply_to");
   p.references = strings_of(o, "references");
   if (const auto* d = o.if_contains("draft"); d && d->is_object()) {
-    p.draft_html = string_of(d->as_object(), "html");
-    p.draft_quoted_html = opt_string_of(d->as_object(), "quoted_html");
+    const json::object& dobj = d->as_object();
+    if (const auto* h = dobj.if_contains("html"); h && h->is_string()) {
+      p.has_draft = true;
+      p.draft_html = utf8_sanitize(h->as_string());
+    }
+    p.draft_quoted_html = opt_string_of(dobj, "quoted_html");
+  }
+  if (const auto* w = o.if_contains("wire"); w && w->is_object()) {
+    p.headers_frozen = true;
+    p.wire_in_reply_to = opt_string_of(w->as_object(), "in_reply_to");
+    p.wire_references = strings_of(w->as_object(), "references");
   }
   return p;
 }
@@ -125,34 +154,54 @@ FrozenPayload payload_from_json(std::string_view text) {
 ResolvedParent resolve_parent_id(db::Conn& c, const FrozenPayload& p, int64_t sender_user_id,
                                  std::optional<int64_t> parent_outbound_id) {
   ResolvedParent r;
-  r.id = p.in_reply_to;
+  r.id = clean_id(p.in_reply_to);
   if (!r.id && p.parent_message_id)
-    r.id = c.scalar<std::string>("SELECT message_id_header FROM messages WHERE id = ? AND owner_id = ?",
-                                 *p.parent_message_id, sender_user_id);
+    r.id = clean_id(c.scalar<std::string>("SELECT message_id_header FROM messages WHERE id = ? AND owner_id = ?",
+                                          *p.parent_message_id, sender_user_id));
   if (!r.id && parent_outbound_id) {
     auto s = c.prepare("SELECT message_id_header, resend_id FROM outbound WHERE id = ?");
     s.bind_all(*parent_outbound_id);
     if (s.step()) {
-      r.id = s.opt_text(0);
-      if (!r.id) {
+      const std::optional<std::string> raw = s.opt_text(0);
+      r.id = clean_id(raw);
+      if (!raw) {
         r.missing = true;
         r.parent_resend_id = s.opt_text(1);
       }
     }
   }
-  if (r.id && r.id->empty()) r.id.reset();
   return r;
+}
+
+WireHeaders wire_headers(db::Conn& c, const FrozenPayload& p, int64_t sender_user_id,
+                         std::optional<int64_t> parent_outbound_id) {
+  WireHeaders w;
+  if (p.headers_frozen) {
+    w.in_reply_to = clean_id(p.wire_in_reply_to);
+    w.references = reference_chain(p.wire_references, std::nullopt);
+    return w;
+  }
+  const ResolvedParent parent = resolve_parent_id(c, p, sender_user_id, parent_outbound_id);
+  w.in_reply_to = parent.id;
+  w.references = reference_chain(p.references, parent.id);
+  w.parent_missing = parent.missing;
+  w.parent_resend_id = parent.parent_resend_id;
+  return w;
 }
 
 std::vector<std::string> sent_references(db::Conn& c, int64_t outbound_id) {
   auto s = c.prepare("SELECT payload_json, sender_user_id, parent_outbound_id FROM outbound WHERE id = ?");
   s.bind_all(outbound_id);
   if (!s.step()) return {};
-  const FrozenPayload p = payload_from_json(s.text(0));
+  const std::string payload = s.text(0);
   const int64_t sender = s.i64(1);
   const std::optional<int64_t> parent_outbound = s.opt_i64(2);
   s.reset();
-  return reference_chain(p.references, resolve_parent_id(c, p, sender, parent_outbound).id);
+  try {
+    return wire_headers(c, payload_from_json(payload), sender, parent_outbound).references;
+  } catch (const PayloadCorrupt&) {
+    return {};  // a reply to it then references the parent's own id only
+  }
 }
 
 std::string format_msgid(std::string_view id) { return "<" + std::string(id) + ">"; }
@@ -171,14 +220,14 @@ std::vector<std::string> reference_chain(const std::vector<std::string>& base,
   std::vector<std::string> out;
   std::set<std::string> seen;
   auto add = [&](const std::string& raw) {
-    std::string id = normalize_message_id(raw);
+    std::string id = sanitize_message_id(raw);
     if (id.empty() || !seen.insert(id).second) return;
     out.push_back(std::move(id));
   };
   for (const auto& r : base) add(r);
   if (parent_id) {
     // The parent id must end the chain even when it already appeared earlier.
-    const std::string pid = normalize_message_id(*parent_id);
+    const std::string pid = sanitize_message_id(*parent_id);
     if (!pid.empty()) {
       out.erase(std::remove(out.begin(), out.end(), pid), out.end());
       out.push_back(pid);
@@ -277,7 +326,15 @@ int64_t cancel_to_draft(db::Tx& tx, int64_t owner, int64_t outbound_id, int64_t 
   o.bind_all(outbound_id);
   if (!o.step()) throw ApiError::not_found("not_found", "邮件不存在");
   const std::optional<int64_t> job_id = o.opt_i64(0);
-  const FrozenPayload payload = payload_from_json(o.text(1));
+  // The pre-freeze body, when the payload has one. Otherwise (unreadable payload, or a payload
+  // without the draft object) the stored sent body is kept: never overwrite the text the user
+  // wrote with "" (review R1).
+  std::optional<std::pair<std::string, std::optional<std::string>>> restored;
+  try {
+    FrozenPayload payload = payload_from_json(o.text(1));
+    if (payload.has_draft) restored.emplace(std::move(payload.draft_html), std::move(payload.draft_quoted_html));
+  } catch (const PayloadCorrupt&) {
+  }
   o.reset();
 
   const auto sender_copy = [&]() -> std::optional<std::pair<int64_t, int64_t>> {
@@ -297,7 +354,12 @@ int64_t cancel_to_draft(db::Tx& tx, int64_t owner, int64_t outbound_id, int64_t 
   delete_shared_copies(tx, outbound_id);           // their owners get threads.changed
   publish_outbound_change(tx, outbound_id, false);  // outbound.status 'canceled' to the sender
 
-  const std::string snippet = make_snippet(payload.draft_html, true);
+  if (!restored)  // keep what was frozen and stored for the sent copy (quote merged in)
+    restored.emplace(tx.scalar<std::string>("SELECT html FROM message_bodies WHERE message_id = ?", message_id)
+                         .value_or(""),
+                     std::nullopt);
+  const auto& [draft_html, draft_quoted_html] = *restored;
+  const std::string snippet = make_snippet(draft_html, true);
   tx.run(
       "UPDATE messages SET is_draft = 1, direction = 'out', outbound_id = NULL, message_id_header = NULL, "
       "in_reply_to = NULL, draft_version = draft_version + 1, date = ?, updated_at = ?, in_inbox = 0, "
@@ -308,7 +370,7 @@ int64_t cancel_to_draft(db::Tx& tx, int64_t owner, int64_t outbound_id, int64_t 
   tx.run(
       "INSERT INTO message_bodies(message_id, html, text, quoted_html) VALUES(?, ?, NULL, ?) "
       "ON CONFLICT(message_id) DO UPDATE SET html = excluded.html, text = NULL, quoted_html = excluded.quoted_html",
-      message_id, payload.draft_html, payload.draft_quoted_html);
+      message_id, draft_html, draft_quoted_html);
   tx.run("DELETE FROM message_refs WHERE message_id = ?", message_id);
   recompute_thread(tx, owner, thread_id);
   fts_reindex(tx, message_id);

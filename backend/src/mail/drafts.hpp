@@ -65,10 +65,13 @@ void delete_draft(db::Tx& tx, int64_t owner, int64_t id);
 //     attachments ≤ cfg.upload_body_limit each and ≤ cfg.max_message_attachment_bytes total
 //     (413 "message_too_large"); scheduled_at within [now + cfg.schedule_min_lead_sec,
 //     now + cfg.schedule_max_days] (422 "invalid_schedule");
-//  3. freeze payload_json (From formatted; html = body + signature (user_settings) +
-//     quoted_html (both already cid:, opts.draft's re-run through rewrite_signed_to_cid),
-//     then strip_att_ids, then strip_api_file_urls(cfg.public_api_base_url) so no signed
-//     /api/files URL ever leaves the server; cid: kept; text = html_to_text of that html;
+//  3. freeze payload_json (From formatted; html = body + quoted_html (both already cid:,
+//     opts.draft's re-run through rewrite_signed_to_cid), then strip_att_ids, then
+//     strip_api_file_urls(cfg.public_api_base_url) so no signed /api/files URL ever leaves the
+//     server; cid: kept; text = html_to_text of that html. The server NEVER appends
+//     user_settings.signature_html: the client inserts the signature into the body
+//     (div[data-azm-signature]) and the user may edit or remove it per message, so the body is
+//     sent exactly as shown in the editor (review F4);
 //     In-Reply-To / References (parent's References + parent id, last 20); X-AzMail-Ref; tag
 //     azmail_outbound; attachments by id — except in forward mode, inline attachments
 //     (is_inline=1) whose content_id the frozen html does not reference are removed from the

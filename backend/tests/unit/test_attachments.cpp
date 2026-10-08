@@ -170,6 +170,9 @@ TEST_CASE("orphan uploads and blob GC queries", "[attachments][gc]") {
     register_blob(tx, lonely, 100);
     register_blob(tx, raw, 100);
     insert_inbound_email(tx, "re_x", raw.sha256);
+    // Still being processed: a delivered row whose copies are all gone no longer pins its raw
+    // (review R3, covered in test_review_be_mail.cpp).
+    tx.run("UPDATE inbound_emails SET state = 'pending' WHERE resend_id = 're_x'");
     register_blob(tx, fresh, 9000);
   });
 
