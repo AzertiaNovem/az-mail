@@ -2,9 +2,12 @@
 // folder, get_thread / get_message rendering, counts, IDOR.
 #include "core/errors.hpp"
 #include "mail/mailbox.hpp"
+#include "mail/serde.hpp"
 #include "mail_fixtures.hpp"
 #include "test_support.hpp"
 #include "ws/events.hpp"
+
+#include <boost/json/serialize.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -442,6 +445,93 @@ TEST_CASE("thread actions update aggregates and folders", "[thread_list][actions
     // Duplicates are applied once.
     CHECK(f.act({t, t, bobs.thread_id}, ThreadAction::Read) == std::vector<int64_t>{t});
   }
+}
+
+TEST_CASE("list_threads: to_preview lists the newest sent message's recipients", "[thread_list]") {
+  Fx f;
+  int64_t ob1 = 0, ob2 = 0;
+  f.ts.db.write([&](db::Tx& tx) {
+    ob1 = insert_outbound(tx, f.alice, f.alice_addr, "delivered");
+    ob2 = insert_outbound(tx, f.alice, f.alice_addr, "delivered");
+  });
+  const Address dave{"Dave", "dave@ext.example"};
+  Msg first;
+  first.owner = f.alice;
+  first.direction = "out";
+  first.from = f.me;
+  first.to = {f.carol};
+  first.subject = "Plan";
+  first.is_read = true;
+  first.in_inbox = false;
+  first.date = kT0;
+  first.outbound_id = ob1;
+  const auto r = f.add(first);
+  // The newest outbound message decides: To + Cc, deduplicated (case-insensitive), me marked.
+  Msg second = first;
+  second.thread_id = r.thread_id;
+  second.to = {dave, Address{"", "CAROL@ext.example"}};
+  second.cc = {f.carol, f.me};
+  second.date = kT0 + 1000;
+  second.outbound_id = ob2;
+  f.add(second);
+  // A draft and an inbound reply do not count.
+  Msg draft = first;
+  draft.thread_id = r.thread_id;
+  draft.is_draft = true;
+  draft.outbound_id.reset();
+  draft.to = {Address{"Eve", "eve@ext.example"}};
+  draft.date = kT0 + 3000;
+  f.add(draft);
+  f.add(f.inbound("Re: Plan", kT0 + 2000, r.thread_id));
+
+  const auto sent = f.folder(Folder::Sent);
+  REQUIRE(sent.items.size() == 1);
+  const auto& tp = sent.items[0].to_preview;
+  REQUIRE(tp.size() == 3);
+  CHECK(tp[0].email == "dave@ext.example");
+  CHECK(tp[0].name == "Dave");
+  CHECK_FALSE(tp[0].is_me);
+  CHECK(tp[1].email == "CAROL@ext.example");
+  CHECK(tp[2].email == "alice@team.example");
+  CHECK(tp[2].is_me);
+
+  // Wire format: additive `to_preview: [{name, email, is_me}]`.
+  const auto j = to_json(sent.items[0]);
+  REQUIRE(j.contains("to_preview"));
+  const auto& arr = j.at("to_preview").as_array();
+  REQUIRE(arr.size() == 3);
+  CHECK(arr[0].as_object().at("email").as_string() == "dave@ext.example");
+  CHECK(arr[2].as_object().at("is_me").as_bool());
+
+  // At most 3; Bcc is never exposed.
+  Msg third = first;
+  third.thread_id = r.thread_id;
+  third.to = {Address{"", "a@ext.example"}, Address{"", "b@ext.example"}};
+  third.cc = {Address{"", "c@ext.example"}, Address{"", "d@ext.example"}};
+  third.bcc = {Address{"", "secret@ext.example"}};
+  third.date = kT0 + 4000;
+  third.outbound_id = ob2;
+  f.add(third);
+  const auto sent2 = f.folder(Folder::Sent);
+  REQUIRE(sent2.items.size() == 1);
+  REQUIRE(sent2.items[0].to_preview.size() == 3);
+  for (const auto& p : sent2.items[0].to_preview) CHECK(p.email != "secret@ext.example");
+  CHECK(boost::json::serialize(to_json(sent2.items[0])).find("secret@") == std::string::npos);
+
+  // A thread without outbound mail has none, and the wire field is omitted.
+  const auto other = f.add(f.inbound("Hello", kT0 + 5000));
+  bool found = false;
+  for (const auto& it : f.folder(Folder::Inbox).items)
+    if (it.id == other.thread_id) {
+      found = true;
+      CHECK(it.to_preview.empty());
+      CHECK_FALSE(to_json(it).contains("to_preview"));
+    }
+  CHECK(found);
+  // Another owner never sees alice's recipients (owner-scoped).
+  ThreadQuery bq;
+  bq.folder = Folder::Sent;
+  CHECK(f.list(bq, f.bob).items.empty());
 }
 
 TEST_CASE("drafts and sent folders follow the outbound status", "[thread_list][aggregates]") {

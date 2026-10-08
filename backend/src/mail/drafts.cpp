@@ -471,26 +471,14 @@ void copy_parent_attachments(db::Tx& tx, int64_t owner, int64_t draft_id, const 
 
 // ---- send freeze --------------------------------------------------------------------------------
 
-// The editor may already carry the signature (inserted client-side): don't append it twice.
-// Image-only signatures have no text to compare and are always appended.
-bool body_contains_signature(std::string_view body, std::string_view signature) {
-  const std::string sig = detail::collapse_whitespace(html_to_text(signature));
-  if (sig.empty()) return false;
-  return detail::collapse_whitespace(html_to_text(body)).find(sig) != std::string::npos;
-}
-
-// body + signature (above the quote, unless the body already carries it) + quoted original,
-// wrapped with inline styles; then data-att-id and our own file URLs are stripped (CONTRACTS
-// §H 26) so only cid: references to local attachments leave the server.
-std::string freeze_html(std::string_view body, std::string_view signature, const std::optional<std::string>& quoted,
-                        std::string_view api_base) {
+// body + quoted original, wrapped with inline styles; then data-att-id and our own file URLs are
+// stripped (CONTRACTS §H 26) so only cid: references to local attachments leave the server.
+// The signature is never added here: the client inserts it into the body
+// (div[data-azm-signature]) where the user can edit or remove it per message, so the body is
+// sent exactly as the editor showed it (review F4).
+std::string freeze_html(std::string_view body, const std::optional<std::string>& quoted, std::string_view api_base) {
   std::string out = "<div style=\"" + std::string(kBodyStyle) + "\">";
   out += body;
-  if (!trim(signature).empty() && !body_contains_signature(body, signature)) {
-    out += "<div class=\"azm-signature\" style=\"margin-top:16px\">";
-    out += signature;
-    out += "</div>";
-  }
   if (quoted && !trim(*quoted).empty()) {
     out += "<div class=\"gmail_quote azm-quote\" style=\"margin-top:16px\">";
     out += *quoted;
@@ -501,20 +489,14 @@ std::string freeze_html(std::string_view body, std::string_view signature, const
 }
 
 struct UserSendSettings {
-  std::string signature_html;
-  bool signature_enabled = true;
   int undo_send_seconds = 5;
 };
 
 UserSendSettings send_settings(db::Conn& c, int64_t owner) {
   UserSendSettings s;
-  auto q = c.prepare("SELECT signature_html, signature_enabled, undo_send_seconds FROM user_settings WHERE user_id = ?");
+  auto q = c.prepare("SELECT undo_send_seconds FROM user_settings WHERE user_id = ?");
   q.bind_all(owner);
-  if (q.step()) {
-    s.signature_html = q.text(0);
-    s.signature_enabled = q.boolean(1);
-    s.undo_send_seconds = static_cast<int>(std::clamp<int64_t>(q.i64(2), 0, 3600));
-  }
+  if (q.step()) s.undo_send_seconds = static_cast<int>(std::clamp<int64_t>(q.i64(0), 0, 3600));
   return s;
 }
 
@@ -672,10 +654,9 @@ SendResult queue_send_impl(db::Tx& tx, const Config& cfg, const SignedUrls* urls
                                                             std::to_string(cfg.schedule_max_days) + " 天内");
   }
 
-  // 2. Freeze the body.
+  // 2. Freeze the body (exactly what the editor holds, plus the quote: no server-side signature).
   const UserSendSettings settings = send_settings(tx.conn(), owner);
-  const std::string signature = settings.signature_enabled ? settings.signature_html : std::string();
-  const std::string html = freeze_html(row->html, signature, row->quoted_html, cfg.public_api_base_url);
+  const std::string html = freeze_html(row->html, row->quoted_html, cfg.public_api_base_url);
   const std::string text = html_to_text(html);
 
   // 3. Attachments: inline parts the frozen HTML no longer references are not sent (except for
@@ -706,7 +687,8 @@ SendResult queue_send_impl(db::Tx& tx, const Config& cfg, const SignedUrls* urls
   std::vector<std::string> refs_base;
   std::optional<int64_t> parent_outbound_id;
   if (parent) {
-    if (parent->message_id_header && !parent->message_id_header->empty()) in_reply_to = parent->message_id_header;
+    if (parent->message_id_header)  // only a header-safe id is ever sent back (review R1)
+      if (std::string pid = sanitize_message_id(*parent->message_id_header); !pid.empty()) in_reply_to = std::move(pid);
     refs_base = parent_references(tx.conn(), *parent);
     if (parent->outgoing) parent_outbound_id = parent->outbound_id;
   }
@@ -764,7 +746,7 @@ SendResult queue_send_impl(db::Tx& tx, const Config& cfg, const SignedUrls* urls
       "UPDATE messages SET is_draft = 0, direction = 'out', outbound_id = ?, from_address_id = ?, from_name = ?, "
       "from_email = ?, to_json = ?, cc_json = ?, bcc_json = ?, reply_to_json = '[]', subject = ?, snippet = ?, "
       "date = ?, message_id_header = NULL, in_reply_to = ?, has_attachments = ?, size_bytes = ?, is_read = 1, "
-      "in_inbox = 0, is_spam = 0, trashed_at = NULL, updated_at = ? WHERE id = ? AND owner_id = ?",
+      "in_inbox = 0, is_spam = 0, trashed_at = NULL, delivered_to = NULL, updated_at = ? WHERE id = ? AND owner_id = ?",
       outbound_id, ident.address_id, ident.address.name, ident.address.email, detail::addresses_to_json(row->to),
       detail::addresses_to_json(row->cc), detail::addresses_to_json(row->bcc), row->subject, fm.snippet, now,
       in_reply_to, fm.has_attachments, fm.size_bytes, now, draft_id, owner);

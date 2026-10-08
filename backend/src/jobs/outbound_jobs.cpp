@@ -31,6 +31,8 @@ constexpr std::string_view kZhNotConfigured = "邮件服务未配置";
 
 constexpr int64_t kReconcileMaxAgeMs = 7LL * 24 * 3600 * 1000;
 constexpr int kReconcileBatch = 50;
+// kv: outbound id the previous outbound.reconcile run polled last (round-robin cursor, R8).
+constexpr std::string_view kReconcileCursorKey = "outbound.reconcile_cursor";
 
 int64_t outbound_id_of(const Job& job) {
   auto it = job.payload.find(payload::kOutboundId);
@@ -60,7 +62,7 @@ void rethrow_transient(const Error& e) {
 
 std::optional<std::string> normalized_msgid(const std::optional<std::string>& raw) {
   if (!raw) return std::nullopt;
-  std::string id = mail::normalize_message_id(*raw);
+  std::string id = mail::sanitize_message_id(*raw);  // header-safe only (review SEC-8)
   if (id.empty()) return std::nullopt;
   return id;
 }
@@ -93,19 +95,24 @@ class SendAttempt {
     if (!svc_.db.write([&](db::Tx& tx) { return mail::mark_sending(tx, id_); })) return;  // canceled / done
 
     mail::OutboundSendPlan plan = load_plan();
-    if (plan.parent_message_id_missing && plan.parent_resend_id && plan.parent_outbound_id) {
-      // B2: capture the parent's Message-ID so In-Reply-To/References are complete.
-      try {
-        const auto parent = client.get(*plan.parent_resend_id, resend::Priority::High);
-        if (auto mid = normalized_msgid(parent.message_id)) {
-          svc_.db.write([&](db::Tx& tx) { mail::set_outbound_message_id(tx, *plan.parent_outbound_id, *mid); });
-          plan = load_plan();
+    if (!plan.headers_frozen) {
+      if (plan.parent_message_id_missing && plan.parent_resend_id && plan.parent_outbound_id) {
+        // B2: capture the parent's Message-ID so In-Reply-To/References are complete.
+        try {
+          const auto parent = client.get(*plan.parent_resend_id, resend::Priority::High);
+          if (auto mid = normalized_msgid(parent.message_id))
+            svc_.db.write([&](db::Tx& tx) { mail::set_outbound_message_id(tx, *plan.parent_outbound_id, *mid); });
+        } catch (const Error& e) {
+          rethrow_transient(e);
+          log::warn("parent Message-ID unavailable; sending without it",
+                    {{"outbound_id", id_}, {"error", error_name(e)}});
         }
-      } catch (const Error& e) {
-        rethrow_transient(e);
-        log::warn("parent Message-ID unavailable; sending without it",
-                  {{"outbound_id", id_}, {"error", error_name(e)}});
       }
+      // RT-3/R6: fix In-Reply-To/References before the first POST that may reach Resend. Every
+      // later attempt under this Idempotency-Key reloads exactly these headers — a parent id
+      // learned in between must not change the body (409 invalid_idempotent_request).
+      svc_.db.write([&](db::Tx& tx) { mail::freeze_send_headers(tx, id_); });
+      plan = load_plan();
     }
 
     resend::SendRequest req;
@@ -155,6 +162,11 @@ class SendAttempt {
       return svc_.db.read([&](db::Conn& c) { return mail::load_send_plan(c, id_); });
     } catch (const std::out_of_range&) {
       throw Permanent("outbound row missing");
+    } catch (const mail::UnsendableOutbound& e) {
+      // R1/R2: an unreadable payload or a missing attachment row never gets better on retry,
+      // and sending an empty or partial mail would be wrong.
+      fail(e.name, e.detail_zh);
+      throw Permanent(e.what());
     }
   }
 
@@ -298,20 +310,28 @@ void run_outbound_fetch_meta(Services& svc, const Job& job, std::stop_token) {
 void run_outbound_reconcile(Services& svc, const Job&, std::stop_token st) {
   if (svc.resend == nullptr) return;
   const int64_t now = svc.now_ms();
-  const auto items = svc.db.read(
-      [&](db::Conn& c) { return mail::outbound_to_reconcile(c, now, kReconcileMaxAgeMs, kReconcileBatch); });
+  // R8: round robin over the candidates. Rows whose Resend state never changes (Resend-scheduled
+  // days ahead, 'sent' without a delivery report) no longer fill every batch: the next run
+  // continues after the last row this one polled.
+  const auto items = svc.db.read([&](db::Conn& c) {
+    const int64_t after = db::kv_get_i64(c, kReconcileCursorKey).value_or(0);
+    return mail::outbound_to_reconcile_after(c, now, kReconcileMaxAgeMs, kReconcileBatch, after);
+  });
   int applied = 0;
+  std::optional<int64_t> polled_up_to;  // the last item whose GET was attempted
   for (const auto& item : items) {
     if (st.stop_requested()) break;
     resend::SentEmail sent;
     try {
       sent = svc.resend->get(item.resend_id, resend::Priority::Low);
     } catch (const Error& e) {
-      if (e.kind == Error::Kind::NotFound) continue;
       if (e.kind == Error::Kind::RateLimited || e.kind == Error::Kind::Network) break;  // next period
+      polled_up_to = item.outbound_id;
+      if (e.kind == Error::Kind::NotFound) continue;
       log::warn("reconcile GET failed", {{"outbound_id", item.outbound_id}, {"error", error_name(e)}});
       continue;
     }
+    polled_up_to = item.outbound_id;
     if (!sent.last_event) continue;
     const auto msgid = normalized_msgid(sent.message_id);
     svc.db.write([&](db::Tx& tx) {
@@ -324,6 +344,8 @@ void run_outbound_reconcile(Services& svc, const Job&, std::stop_token st) {
       if (mail::apply_outbound_event(tx, ev).status_changed) ++applied;
     });
   }
+  if (polled_up_to)
+    svc.db.write([&](db::Tx& tx) { db::kv_set_i64(tx, kReconcileCursorKey, *polled_up_to, svc.now_ms()); });
   if (applied > 0) log::info("reconcile applied status changes", {{"count", applied}});
 }
 
@@ -331,8 +353,9 @@ void register_outbound_jobs(Runner& runner) {
   const Config& cfg = runner.services().cfg;
   runner.on(std::string(kinds::kOutboundSend), std::string(lanes::kOutbound), run_outbound_send);
   runner.on(std::string(kinds::kOutboundFetchMeta), std::string(lanes::kSync), run_outbound_fetch_meta);
+  // The configured interval as is (app/config.cpp validates its minimum); no hidden clamp.
   runner.on(std::string(kinds::kOutboundReconcile), std::string(lanes::kMaintenance), run_outbound_reconcile,
-            std::chrono::seconds(std::max(60, cfg.reconcile_interval_sec)));
+            std::chrono::seconds(cfg.reconcile_interval_sec));
 }
 
 void register_all_jobs(Runner& runner) {

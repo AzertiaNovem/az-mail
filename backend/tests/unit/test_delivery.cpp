@@ -169,7 +169,9 @@ TEST_CASE("loopback merge with X-AzMail-Ref: no duplicate for owners holding a c
   CHECK(fx.folder_ids(Folder::Inbox) == std::vector<int64_t>{s.thread_id});
   CHECK(fx.events_of(ws::events::kMailNew, fx.bob).size() == 1);
   CHECK(fx.events_of(ws::events::kMailNew, fx.alice).empty());
-  CHECK(fx.outbound(s.outbound_id).message_id_header == "loop@resend.dev");
+  // Without DKIM/DMARC pass the mail cannot decide our Message-ID (review SEC-3): capture source
+  // (c) needs an authenticated loopback; the webhook / fetch_meta capture it instead.
+  CHECK_FALSE(fx.outbound(s.outbound_id).message_id_header.has_value());
   // Re-delivery of the same email is a no-op.
   CHECK(fx.deliver(e).state == DeliveryResult::State::Duplicate);
 }

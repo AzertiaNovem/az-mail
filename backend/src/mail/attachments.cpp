@@ -49,9 +49,14 @@ std::string clean_filename(std::string_view raw, std::size_t max_bytes) {
   return std::string(trim(out));
 }
 
+// An inbound raw .eml (full body + base64 attachments) is live only while a message delivered
+// from it still exists, or while its inbound row is still being processed (pending / failed:
+// it may be retried). Once every copy is deleted forever or purged — or the mail was
+// unroutable — it is garbage (review R3); inbound_emails rows themselves are kept as history.
 constexpr std::string_view kUnreferenced =
     "NOT EXISTS (SELECT 1 FROM attachments a WHERE a.blob_sha256 = b.sha256) AND "
-    "NOT EXISTS (SELECT 1 FROM inbound_emails i WHERE i.raw_sha256 = b.sha256)";
+    "NOT EXISTS (SELECT 1 FROM inbound_emails i WHERE i.raw_sha256 = b.sha256 AND "
+    "(i.state NOT IN ('delivered','unroutable') OR EXISTS (SELECT 1 FROM messages m WHERE m.inbound_id = i.id)))";
 
 }  // namespace
 
@@ -159,8 +164,12 @@ bool is_blob_unreferenced(db::Conn& c, std::string_view sha256) {
 }
 
 bool forget_blob_if_unreferenced(db::Tx& tx, std::string_view sha256) {
-  tx.run("DELETE FROM blobs AS b WHERE b.sha256 = ? AND " + std::string(kUnreferenced),
-         to_lower_ascii(sha256));
+  const std::string sha = to_lower_ascii(sha256);
+  if (!tx.scalar<int64_t>("SELECT 1 FROM blobs b WHERE b.sha256 = ? AND " + std::string(kUnreferenced), sha))
+    return false;
+  // Finished inbound rows keep their metadata but no longer point at the raw (FK to blobs).
+  tx.run("UPDATE inbound_emails SET raw_sha256 = NULL WHERE raw_sha256 = ?", sha);
+  tx.run("DELETE FROM blobs WHERE sha256 = ?", sha);
   return tx.changes() > 0;
 }
 

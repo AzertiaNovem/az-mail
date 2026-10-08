@@ -17,6 +17,7 @@
 #include <boost/json/array.hpp>
 #include <boost/json/object.hpp>
 
+#include <algorithm>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -173,15 +174,59 @@ void throw_for(ScheduleState st) {
   }
 }
 
+// The sender's own (non-shared, non-draft) copy still points at the outbound.
+bool has_sender_copy(db::Conn& c, int64_t outbound_id) {
+  return c
+      .scalar<int64_t>(
+          "SELECT 1 FROM messages WHERE outbound_id = ? AND is_shared_copy = 0 AND is_draft = 0 LIMIT 1",
+          outbound_id)
+      .has_value();
+}
+
+// Review SEC-4: the sender is still active and may still send as the frozen identity (the
+// send-as rule of drafts.hpp, re-checked at send / retry time).
+bool sender_allowed(db::Conn& c, int64_t sender, int64_t from_address_id) {
+  if (!c.scalar<int64_t>("SELECT 1 FROM users WHERE id = ? AND disabled = 0", sender)) return false;
+  try {
+    (void)resolve_sender(c, sender, from_address_id);
+    return true;
+  } catch (const ApiError&) {
+    return false;
+  }
+}
+
+constexpr std::string_view kZhSenderNotAllowed = "发件人已无权使用该地址发送";
+
+// The copies' date becomes the moment a scheduled send actually went out (review R9).
+void date_copies(db::Tx& tx, int64_t outbound_id, int64_t at) {
+  tx.run("UPDATE messages SET date = ? WHERE outbound_id = ? AND is_draft = 0", at, outbound_id);
+}
+
 // New outbound row for a failed send (new uuid = new Idempotency-Key, B1); every copy is
-// re-pointed to it and outbound.send enqueued. The failed row stays as history.
+// re-pointed to it and outbound.send enqueued. The failed row stays as history and records
+// local.superseded. Refused when the sender's copy no longer points at the row (already retried,
+// or deleted: review R4) and when the sender may no longer send as its identity (SEC-4).
 int64_t clone_failed_outbound(db::Tx& tx, const OutboundRow& old, int64_t now) {
+  if (!has_sender_copy(tx.conn(), old.id)) throw invalid_state("该发送记录已被重试或邮件已删除");
+  if (!sender_allowed(tx.conn(), old.sender_user_id, old.from_address_id))
+    throw ApiError::forbidden("send_as_forbidden", std::string(kZhSenderNotAllowed));
   const bool keep_schedule = old.scheduled_at && *old.scheduled_at > now + kRetryMinLeadMs;
   const std::optional<int64_t> scheduled_at = keep_schedule ? old.scheduled_at : std::nullopt;
   std::optional<std::string> via;
   if (keep_schedule) via = std::string(to_string(old.scheduled_via.value_or(ScheduledVia::Local)));
-  const std::string payload =
-      tx.scalar<std::string>("SELECT payload_json FROM outbound WHERE id = ?", old.id).value_or("{}");
+  // A new Idempotency-Key may carry a body that differs from the old row's: the new row
+  // resolves its wire headers afresh (a parent Message-ID learned since is picked up).
+  std::string payload;
+  try {
+    FrozenPayload p = detail::payload_from_json(
+        tx.scalar<std::string>("SELECT payload_json FROM outbound WHERE id = ?", old.id).value_or("{}"));
+    p.headers_frozen = false;
+    p.wire_in_reply_to.reset();
+    p.wire_references.clear();
+    payload = detail::payload_to_json(p);
+  } catch (const detail::PayloadCorrupt&) {
+    throw invalid_state("发送数据已损坏，无法重试");
+  }
   tx.run(
       "INSERT INTO outbound(uuid, sender_user_id, from_address_id, status, send_after, scheduled_at, scheduled_via, "
       "parent_outbound_id, payload_json, total_bytes, created_at, updated_at) "
@@ -194,6 +239,9 @@ int64_t clone_failed_outbound(db::Tx& tx, const OutboundRow& old, int64_t now) {
   ev["retry_of"] = old.id;
   if (scheduled_at) ev["scheduled_at"] = *scheduled_at;
   detail::record_delivery_event(tx, id, "local.queued", now, ev);
+  json::object superseded;
+  superseded["retry_id"] = id;
+  detail::record_delivery_event(tx, old.id, "local.superseded", now, superseded);
   const int64_t run_at = keep_schedule && via == "local" ? *scheduled_at : now;
   detail::enqueue_send_job(tx, id, run_at, now);
   detail::publish_outbound_change(tx, id, true);
@@ -216,8 +264,14 @@ std::optional<OutboundRow> get_outbound(db::Conn& c, int64_t outbound_id) {
 OutboundSendPlan load_send_plan(db::Conn& c, int64_t outbound_id) {
   const auto row = get_outbound(c, outbound_id);
   if (!row) throw std::out_of_range("outbound " + std::to_string(outbound_id) + " not found");
-  const FrozenPayload p = detail::payload_from_json(
-      c.scalar<std::string>("SELECT payload_json FROM outbound WHERE id = ?", outbound_id).value_or("{}"));
+  FrozenPayload p;
+  try {
+    p = detail::payload_from_json(
+        c.scalar<std::string>("SELECT payload_json FROM outbound WHERE id = ?", outbound_id).value_or("{}"));
+  } catch (const detail::PayloadCorrupt&) {
+    // Never send an empty plan (no From/To/body) and never retry it: it cannot get better.
+    throw UnsendableOutbound("payload_corrupt", "发送数据已损坏，无法发送");
+  }
 
   OutboundSendPlan plan;
   plan.outbound_id = row->id;
@@ -238,16 +292,16 @@ OutboundSendPlan load_send_plan(db::Conn& c, int64_t outbound_id) {
   plan.total_bytes = row->total_bytes;
   plan.parent_outbound_id = row->parent_outbound_id;
 
-  // Parent Message-ID: frozen value, else whatever was captured since (B2).
-  const detail::ResolvedParent parent = detail::resolve_parent_id(c, p, row->sender_user_id, row->parent_outbound_id);
-  const std::optional<std::string>& parent_id = parent.id;
-  plan.parent_message_id_missing = parent.missing;
-  plan.parent_resend_id = parent.parent_resend_id;
+  // Threading headers: frozen before the first POST (RT-3), else the parent Message-ID as known
+  // now — the frozen value, else whatever was captured since (B2).
+  const detail::WireHeaders wire = detail::wire_headers(c, p, row->sender_user_id, row->parent_outbound_id);
+  plan.parent_message_id_missing = wire.parent_missing;
+  plan.parent_resend_id = wire.parent_resend_id;
+  plan.headers_frozen = p.headers_frozen;
 
   plan.headers.emplace_back(std::string(kHeaderAzmailRef), row->uuid);
-  if (parent_id) plan.headers.emplace_back("In-Reply-To", detail::format_msgid(*parent_id));
-  if (const auto chain = detail::reference_chain(p.references, parent_id); !chain.empty())
-    plan.headers.emplace_back("References", detail::format_msgid_list(chain));
+  if (wire.in_reply_to) plan.headers.emplace_back("In-Reply-To", detail::format_msgid(*wire.in_reply_to));
+  if (!wire.references.empty()) plan.headers.emplace_back("References", detail::format_msgid_list(wire.references));
   plan.tags.emplace_back(std::string(kTagOutbound), row->uuid);
 
   if (!p.attachment_ids.empty()) {
@@ -264,11 +318,36 @@ OutboundSendPlan load_send_plan(db::Conn& c, int64_t outbound_id) {
       a.size = s.i64(3);
       a.filename = s.text(4);
       a.content_type = s.text(5);
-      a.content_id = s.opt_text(6);
+      if (const auto cid = s.opt_text(6))  // SEC-8: only a header-safe Content-ID leaves the server
+        if (std::string clean = sanitize_message_id(*cid); !clean.empty()) a.content_id = std::move(clean);
       plan.attachments.push_back(std::move(a));
     }
+    // An attachment row of the frozen payload is gone (e.g. its message was deleted): sending
+    // the mail without it would be silently wrong (review R2).
+    const std::set<int64_t> wanted(p.attachment_ids.begin(), p.attachment_ids.end());
+    if (plan.attachments.size() != wanted.size())
+      throw UnsendableOutbound("attachment_missing", "附件文件丢失，无法发送");
   }
   return plan;
+}
+
+bool freeze_send_headers(db::Tx& tx, int64_t outbound_id) {
+  const auto row = get_outbound(tx.conn(), outbound_id);
+  if (!row) return false;
+  FrozenPayload p;
+  try {
+    p = detail::payload_from_json(
+        tx.scalar<std::string>("SELECT payload_json FROM outbound WHERE id = ?", outbound_id).value_or("{}"));
+  } catch (const detail::PayloadCorrupt&) {
+    return false;  // load_send_plan reports it
+  }
+  if (p.headers_frozen) return false;
+  const detail::WireHeaders wire = detail::wire_headers(tx.conn(), p, row->sender_user_id, row->parent_outbound_id);
+  p.headers_frozen = true;
+  p.wire_in_reply_to = wire.in_reply_to;
+  p.wire_references = wire.references;
+  tx.run("UPDATE outbound SET payload_json = ? WHERE id = ?", detail::payload_to_json(p), outbound_id);
+  return true;
 }
 
 std::optional<int64_t> find_outbound(db::Conn& c, std::optional<std::string_view> resend_id,
@@ -292,6 +371,24 @@ std::vector<ReconcileItem> outbound_to_reconcile(db::Conn& c, int64_t now_ms, in
   return out;
 }
 
+std::vector<ReconcileItem> outbound_to_reconcile_after(db::Conn& c, int64_t now_ms, int64_t max_age_ms, int limit,
+                                                       int64_t after_id) {
+  std::vector<ReconcileItem> out;
+  if (limit <= 0) return out;
+  auto take = [&](std::string_view id_cond, int64_t bound, int64_t n) {
+    auto s = c.prepare(
+        "SELECT id, resend_id, status FROM outbound WHERE status IN ('accepted','scheduled','sent','delivery_delayed') "
+        "AND updated_at >= ? AND resend_id IS NOT NULL AND id " + std::string(id_cond) + " ? ORDER BY id LIMIT ?");
+    s.bind_all(now_ms - max_age_ms, bound, n);
+    while (s.step())
+      out.push_back({s.i64(0), s.text(1), parse_outbound_status(s.text(2)).value_or(OutboundStatus::Accepted)});
+  };
+  take(">", after_id, limit);
+  if (static_cast<int>(out.size()) < limit && after_id > 0)  // wrap around to the start
+    take("<=", after_id, limit - static_cast<int64_t>(out.size()));
+  return out;
+}
+
 // =============================================================================================
 // Job transitions
 // =============================================================================================
@@ -300,6 +397,26 @@ bool mark_sending(db::Tx& tx, int64_t outbound_id) {
   const auto row = get_outbound(tx.conn(), outbound_id);
   if (!row || (row->status != OutboundStatus::Queued && row->status != OutboundStatus::Sending)) return false;
   const int64_t now = azm::now_ms();
+  if (!has_sender_copy(tx.conn(), outbound_id)) {
+    // Nobody holds the sender's copy any more (deleted): nothing may go out in their name, and
+    // nobody could ever see, cancel or retry it (review R2).
+    tx.run("UPDATE outbound SET status = 'canceled', status_detail = NULL, updated_at = ? WHERE id = ? AND "
+           "status IN ('queued','sending')",
+           now, outbound_id);
+    if (tx.changes() > 0) {
+      if (row->job_id) jobs::cancel(tx, *row->job_id);
+      json::object ev;
+      ev["reason"] = "sender_copy_deleted";
+      detail::record_delivery_event(tx, outbound_id, "local.canceled", now, ev);
+      detail::delete_shared_copies(tx, outbound_id);
+      detail::publish_outbound_change(tx, outbound_id, true);
+    }
+    return false;
+  }
+  if (!sender_allowed(tx.conn(), row->sender_user_id, row->from_address_id)) {  // review SEC-4
+    mark_failed(tx, outbound_id, "sender_not_allowed", kZhSenderNotAllowed);
+    return false;
+  }
   tx.run("UPDATE outbound SET status = 'sending', updated_at = ? WHERE id = ? AND status IN ('queued','sending')",
          now, outbound_id);
   if (tx.changes() == 0) return false;
@@ -324,9 +441,14 @@ void mark_accepted(db::Tx& tx, int64_t outbound_id, std::string_view resend_id, 
   ev["resend_id"] = resend_id;
   ev["scheduled"] = sched;
   detail::record_delivery_event(tx, outbound_id, "local.accepted", now, ev);
+  // A scheduled send that goes out right now (local scheduling, or Resend refused to schedule
+  // it, B5): the copies were dated at queue time — date them at the real send (review R9).
+  const bool dated = row->scheduled_at.has_value() && !sched;
+  if (dated) date_copies(tx, outbound_id, now);
   const OutboundStatus next = sched ? OutboundStatus::Scheduled : OutboundStatus::Accepted;
   // A webhook may already have moved it further (email.sent before the POST returned).
   if (should_apply(row->status, next)) transition(tx, *row, next, std::nullopt, std::nullopt, now);
+  else if (dated) detail::publish_outbound_change(tx, outbound_id, true);  // re-sorted threads
 }
 
 void mark_failed(db::Tx& tx, int64_t outbound_id, std::string_view name, std::string_view detail_zh) {
@@ -393,7 +515,16 @@ EventApplyResult apply_outbound_event(db::Tx& tx, const OutboundEvent& ev) {
     for (const auto& r : ev.recipients) to.emplace_back(json::string(r));
     detail["to"] = std::move(to);
   }
-  if (!detail::record_delivery_event(tx, *id, ev.type, occurred, detail, ev.source_key)) {
+  // A poll (reconcile / fetch_meta) only restates Resend's last_event: when that event is already
+  // recorded (normally from its webhook) it adds nothing — not a second "delivered" row in the
+  // message's event log. Reconcile polls every interval, so this is the common case.
+  const bool poll_restates_known =
+      istarts_with(ev.source_key, "poll:") &&
+      tx.scalar<int64_t>("SELECT 1 FROM delivery_events WHERE outbound_id = ? AND type = ? LIMIT 1", *id, ev.type)
+          .has_value();
+  if (poll_restates_known || !detail::record_delivery_event(tx, *id, ev.type, occurred, detail, ev.source_key)) {
+    if (poll_restates_known && ev.message_id && !row.message_id_header)
+      set_outbound_message_id(tx, *id, *ev.message_id);
     res.outcome = EventOutcome::Duplicate;
     return res;
   }
@@ -412,10 +543,32 @@ EventApplyResult apply_outbound_event(db::Tx& tx, const OutboundEvent& ev) {
                                  !resend_id_taken(tx.conn(), *ev.resend_id, *id);
   if (learned_resend_id) tx.run("UPDATE outbound SET resend_id = ? WHERE id = ?", *ev.resend_id, *id);
 
+  // Resend no longer holds the scheduled send (review R10: a cancel whose response was lost, or
+  // canceled in the Resend dashboard): finish the cancel like finish_cancel_schedule. A plain
+  // 'canceled' status would leave the non-draft copy in no folder at all (status_class).
+  if (iequals(ev.type, "email.canceled") && row.scheduled_via == ScheduledVia::Resend &&
+      (row.status == OutboundStatus::Accepted || row.status == OutboundStatus::Scheduled)) {
+    tx.run("UPDATE outbound SET status = 'canceled', status_detail = NULL, updated_at = ? WHERE id = ?", now, *id);
+    if (has_sender_copy(tx.conn(), *id)) {
+      detail::cancel_to_draft(tx, row.sender_user_id, *id, now);
+    } else {
+      detail::record_delivery_event(tx, *id, "local.canceled", now, {});
+      detail::delete_shared_copies(tx, *id);
+      detail::publish_outbound_change(tx, *id, true);
+    }
+    res.status_changed = true;
+    res.status = OutboundStatus::Canceled;
+    return res;
+  }
+
   if (const auto next = status_for_event(ev.type); next && should_apply(row.status, *next)) {
     std::optional<std::string> text;
     if (*next != OutboundStatus::Sent && *next != OutboundStatus::Delivered && *next != OutboundStatus::Scheduled)
       text = event_detail_text(ev.detail);
+    // A Resend-scheduled send just went out: date its copies at that moment (review R9).
+    if (row.scheduled_at && row.scheduled_via == ScheduledVia::Resend && rank(row.status) <= rank(OutboundStatus::Scheduled) &&
+        rank(*next) >= rank(OutboundStatus::Sent) && *next != OutboundStatus::Canceled)
+      date_copies(tx, *id, std::min(occurred, now));
     transition(tx, row, *next, text, std::nullopt, now);
     res.status_changed = true;
     res.status = *next;
@@ -441,12 +594,16 @@ EventApplyResult apply_outbound_event(db::Tx& tx, const OutboundEvent& ev) {
 // =============================================================================================
 
 void set_outbound_message_id(db::Tx& tx, int64_t outbound_id, std::string_view msgid) {
-  const std::string id = normalize_message_id(msgid);
+  const std::string id = sanitize_message_id(msgid);
   if (id.empty()) return;
+  std::string identity;  // the From the outbound was sent with
   {
-    auto s = tx.prepare("SELECT message_id_header FROM outbound WHERE id = ?");
+    auto s = tx.prepare(
+        "SELECT o.message_id_header, a.email FROM outbound o JOIN addresses a ON a.id = o.from_address_id "
+        "WHERE o.id = ?");
     s.bind_all(outbound_id);
     if (!s.step() || !s.is_null(0)) return;  // missing, or already known (never overwritten)
+    identity = normalize_email(s.text(1));
   }
   const int64_t now = azm::now_ms();
   tx.run("UPDATE outbound SET message_id_header = ?, updated_at = ? WHERE id = ?", id, now, outbound_id);
@@ -464,12 +621,15 @@ void set_outbound_message_id(db::Tx& tx, int64_t outbound_id, std::string_view m
     };
     std::vector<InCopy> loops;
     {
+      // Only our own mail can be a loopback: its From is the outbound's identity. Anything else
+      // carrying this Message-ID is somebody else's message and is never touched (review SEC-3).
       auto s = tx.prepare(
-          "SELECT id, thread_id, is_read, is_starred, in_inbox, (trashed_at IS NULL AND is_spam = 0), delivered_to "
-          "FROM messages WHERE owner_id = ? AND direction = 'in' AND message_id_header = ?");
+          "SELECT id, thread_id, is_read, is_starred, in_inbox, (trashed_at IS NULL AND is_spam = 0), delivered_to, "
+          "from_email FROM messages WHERE owner_id = ? AND direction = 'in' AND message_id_header = ?");
       s.bind_all(copy.owner_id, id);
       while (s.step())
-        loops.push_back({s.i64(0), s.i64(1), s.boolean(2), s.boolean(3), s.boolean(4), s.boolean(5), s.opt_text(6)});
+        if (normalize_email(s.text(7)) == identity)
+          loops.push_back({s.i64(0), s.i64(1), s.boolean(2), s.boolean(3), s.boolean(4), s.boolean(5), s.opt_text(6)});
     }
     for (const auto& in : loops) {
       tx.run("INSERT OR IGNORE INTO message_labels(message_id, label_id) SELECT ?, label_id FROM message_labels "
@@ -615,6 +775,58 @@ int64_t admin_retry_outbound(db::Tx& tx, int64_t outbound_id, int64_t now_ms) {
   if (!row) throw ApiError::not_found("not_found", "发送记录不存在");
   if (row->status != OutboundStatus::Failed) throw invalid_state("只有发送失败的邮件可以重试");
   return clone_failed_outbound(tx, *row, now);
+}
+
+// =============================================================================================
+// Deleting the sender's copy of a pending send (review R2)
+// =============================================================================================
+
+PendingSend cancel_pending_send(db::Tx& tx, int64_t owner, int64_t message_id, CopyRemoval how, int64_t now_ms) {
+  const int64_t now = now_ms > 0 ? now_ms : azm::now_ms();
+  const auto outbound_id = tx.scalar<int64_t>(
+      "SELECT outbound_id FROM messages WHERE id = ? AND owner_id = ? AND is_shared_copy = 0 AND is_draft = 0 "
+      "AND outbound_id IS NOT NULL",
+      message_id, owner);
+  if (!outbound_id) return PendingSend::None;
+  const auto row = get_outbound(tx.conn(), *outbound_id);
+  if (!row || row->sender_user_id != owner) return PendingSend::None;
+  const bool scheduled = row->scheduled_at.has_value();
+  switch (row->status) {
+    case OutboundStatus::Queued: {
+      // Trashing during the undo window of an immediate send does not unsend it (the copy stays
+      // visible in Trash as sent mail and can still be restored); a scheduled one would vanish
+      // from 定时 while still going out later, so it is canceled.
+      if (how == CopyRemoval::Trash && !scheduled) return PendingSend::None;
+      tx.run("UPDATE outbound SET status = 'canceled', status_detail = NULL, updated_at = ? WHERE id = ? AND "
+             "status = 'queued'",
+             now, row->id);
+      if (tx.changes() == 0) return PendingSend::None;
+      if (how == CopyRemoval::Trash) {
+        detail::cancel_to_draft(tx, owner, row->id, now);  // back to a draft (then trashed by the caller)
+      } else {
+        // The copy is about to be deleted: nothing to restore, only the send to stop.
+        if (row->job_id) jobs::cancel(tx, *row->job_id);
+        json::object ev;
+        ev["reason"] = "sender_copy_deleted";
+        detail::record_delivery_event(tx, row->id, "local.canceled", now, ev);
+        detail::delete_shared_copies(tx, row->id);
+        detail::publish_outbound_change(tx, row->id, true);
+      }
+      return PendingSend::Canceled;
+    }
+    case OutboundStatus::Sending:
+      // A POST is under way (or being retried). Trashing an immediate send is harmless; a
+      // scheduled one is about to be held by Resend, and deleting the copy would pull its
+      // attachments from under the retry.
+      if (how == CopyRemoval::Trash && !scheduled) return PendingSend::None;
+      return PendingSend::InFlight;
+    case OutboundStatus::Accepted:
+    case OutboundStatus::Scheduled:
+      if (row->scheduled_via == ScheduledVia::Resend && row->scheduled_at && *row->scheduled_at > now)
+        return PendingSend::RemoteScheduled;
+      return PendingSend::None;
+    default: return PendingSend::None;
+  }
 }
 
 }  // namespace azm::mail

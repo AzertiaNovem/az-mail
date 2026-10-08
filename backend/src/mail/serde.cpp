@@ -224,6 +224,17 @@ json::object to_json(const ThreadListItem& t) {
     prev.emplace_back(std::move(x));
   }
   o["attachments_preview"] = std::move(prev);
+  if (!t.to_preview.empty()) {  // additive, optional (F16): omitted when the view has no sent mail
+    json::array to_prev;
+    for (const auto& p : t.to_preview) {
+      json::object x;
+      x["name"] = p.name;
+      x["email"] = p.email;
+      x["is_me"] = p.is_me;
+      to_prev.emplace_back(std::move(x));
+    }
+    o["to_preview"] = std::move(to_prev);
+  }
   return o;
 }
 

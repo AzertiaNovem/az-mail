@@ -150,7 +150,7 @@ TEST_CASE("queue_send validation errors", "[outbound][send][validation]") {
 TEST_CASE("queue_send freeze: payload, headers, tags, signature above the quote", "[outbound][send][freeze]") {
   SendFx fx;
   fx.ts.db.write([&](db::Tx& tx) {
-    tx.run("UPDATE user_settings SET signature_enabled = 1, signature_html = '<p>张三 | 运营部</p>', "
+    tx.run("UPDATE user_settings SET signature_enabled = 1, signature_html = '<p>设置里的签名</p>', "
            "undo_send_seconds = 5 WHERE user_id = ?", fx.alice);
   });
   // Parent: an inbound mail whose References chain is stored in order in inbound_emails.meta_json.
@@ -169,7 +169,9 @@ TEST_CASE("queue_send freeze: payload, headers, tags, signature above the quote"
   in.to = std::vector<Address>{{"王五 (采购)", "wang@customer.example"}};
   in.cc = std::vector<Address>{kBob, {"", "WANG@customer.example"}};  // duplicate of To is dropped
   in.bcc = std::vector<Address>{kCarol};
-  in.html = "<p>好的</p><img data-att-id=\"" + std::to_string(inl.id) + "\" src=\"" + *inl.view_url + "\">";
+  // The editor inserted (and here kept) the signature block itself (review F4).
+  in.html = "<p>好的</p><img data-att-id=\"" + std::to_string(inl.id) + "\" src=\"" + *inl.view_url +
+            "\"><div data-azm-signature=\"\"><p>张三 | 运营部</p></div>";
   in.quoted_html = std::optional<std::string>("<blockquote>原邮件 <a href=\"" + fx.ts.urls.base_url() +
                                               "/api/files/999?d=a&sig=x\">链接</a></blockquote>");
   const Draft d = fx.create(in);
@@ -208,6 +210,7 @@ TEST_CASE("queue_send freeze: payload, headers, tags, signature above the quote"
   REQUIRE(quote_at != std::string::npos);
   CHECK(body_at < sig_at);
   CHECK(sig_at < quote_at);
+  CHECK(p.html.find("设置里的签名") == std::string::npos);  // the server never appends one (F4)
   CHECK(p.html.find("cid:" + *inl.content_id) != std::string::npos);
   CHECK(p.html.find("data-att-id") == std::string::npos);
   CHECK(p.html.find("/api/files/") == std::string::npos);
@@ -320,10 +323,12 @@ TEST_CASE("signature: disabled, already in the body, image-only", "[outbound][se
   set_sig(true, "<p>签名A</p>");
   const auto p1 = fx.plan(fx.send(fx.simple_draft({kBob}, "s", "<p>正文</p><p>签名A</p>")).outbound_id);
   CHECK(count(p1.html, "签名A") == 1);  // inserted by the editor already: not duplicated
+  // The client owns the signature (review F4): a body without it (不使用签名) is sent without it,
+  // image-only signatures included.
   set_sig(true, "<img src=\"https://cdn.example/sig.png\">");
   const auto p2 = fx.plan(fx.send(fx.simple_draft({kBob})).outbound_id);
-  CHECK(p2.html.find("https://cdn.example/sig.png") != std::string::npos);
-  CHECK(p2.html.find("azm-signature") != std::string::npos);
+  CHECK(p2.html.find("https://cdn.example/sig.png") == std::string::npos);
+  CHECK(p2.html.find("azm-signature") == std::string::npos);
 }
 
 TEST_CASE("scheduling decision: resend vs local (B5)", "[outbound][send][schedule]") {

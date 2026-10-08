@@ -198,7 +198,18 @@ http::Response messages_cancel_schedule(http::Ctx& ctx) {
   try {
     svc.resend_client().cancel(plan.resend_id);  // outside any transaction
   } catch (const resend::Error& e) {
-    map_schedule_error(e, "cancel");
+    // Review R10: an earlier cancel may have reached Resend while its response was lost; Resend
+    // then refuses this one. If it reports the email as canceled, finish the cancel locally
+    // instead of claiming the mail was sent.
+    bool already_canceled = false;
+    if (e.kind == resend::Error::Kind::Validation) {
+      try {
+        const auto sent = svc.resend_client().get(plan.resend_id, resend::Priority::High);
+        already_canceled = sent.last_event && iequals(trim(*sent.last_event), "canceled");
+      } catch (const std::exception&) {  // unknown: report the original rejection
+      }
+    }
+    if (!already_canceled) map_schedule_error(e, "cancel");
   }
   const auto d = svc.db.write([&](db::Tx& tx) {
     return mail::finish_cancel_schedule(tx, svc.signed_urls, owner, plan.outbound_id);

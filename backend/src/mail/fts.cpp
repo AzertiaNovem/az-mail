@@ -63,7 +63,12 @@ void fts_reindex(db::Tx& tx, int64_t message_id) {
 
   std::string body;
   if (auto text = s.opt_text(8)) body = utf8_sanitize(*text);
-  else if (auto html = s.opt_text(9)) body = html_to_text(*html);
+  else if (auto html = s.opt_text(9)) {
+    // Only kFtsBodyLimit bytes of text are kept: converting more than a few MiB of HTML is
+    // wasted work inside the write transaction (review SEC-1).
+    constexpr std::size_t kMaxHtmlInput = 4u << 20;
+    body = html->size() > kMaxHtmlInput ? html_to_text(utf8_truncate(*html, kMaxHtmlInput)) : html_to_text(*html);
+  }
   if (body.size() > kFtsBodyLimit) body = utf8_truncate(body, kFtsBodyLimit);
 
   std::string attach_names;

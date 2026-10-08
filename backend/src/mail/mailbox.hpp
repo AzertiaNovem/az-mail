@@ -52,6 +52,14 @@ Counts counts(db::Conn& c, int64_t owner);
 // Unknown / foreign thread ids are skipped. Returns the affected thread ids (deleted threads
 // included). Throws ApiError(400, "invalid_field", {field:"label_id"}) when a label action has
 // no label_id, ApiError(404, "not_found") when the label is not the owner's.
+// (review R2) trash / delete_forever first settle the sender's own copies of pending sends
+// (outbound.hpp cancel_pending_send): a queued scheduled send (trash) or any queued send
+// (delete_forever) is canceled in the same transaction — with trash the copy becomes a
+// (trashed) draft like undo; an immediate send in its undo window is NOT canceled by trash.
+// Refused (whole request rolled back) with ApiError(409, "scheduled_send_pending",
+// {thread_id, message_id}) when Resend holds the scheduled send (cancel the schedule first) or a
+// scheduled send is being submitted, and with ApiError(409, "send_in_progress") when
+// delete_forever hits a send that is being POSTed.
 std::vector<int64_t> apply_thread_action(db::Tx& tx, int64_t owner, std::span<const int64_t> ids,
                                          ThreadAction action, std::optional<int64_t> label_id);
 
@@ -87,8 +95,12 @@ struct PurgeResult {
   bool more = false;  // the limit was hit; call again
 };
 // Hard-deletes up to `limit` messages trashed more than trash_days ago or spam older than
-// spam_days (by date), for all owners; recomputes their threads and emits threads.changed per
-// owner. Blobs are left to gc.blobs. Not owner-scoped (system maintenance).
+// spam_days, for all owners; recomputes their threads and emits threads.changed per owner.
+// Blobs are left to gc.blobs. Not owner-scoped (system maintenance).
+// (review R5) Spam age counts from MAX(date, created_at, updated_at) — arrival for delivered
+// spam, the Spam action (which bumps updated_at) for reported mail — never from an old Date
+// header alone. (review R2) A sender copy whose send Resend holds (scheduled) or that is being
+// POSTed is skipped until that settles; a queued send of a victim is canceled first.
 PurgeResult purge_trash(db::Tx& tx, int64_t now_ms, int trash_days, int spam_days, int limit);
 
 }  // namespace azm::mail

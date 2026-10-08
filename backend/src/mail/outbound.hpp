@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -49,18 +50,44 @@ struct OutboundRow {
 
 std::optional<OutboundRow> get_outbound(db::Conn& c, int64_t outbound_id);
 
+// (additive, review R1/R2) The outbound cannot be sent as it was frozen. `name` is the
+// error_name the job records with mark_failed, `detail_zh` the status_detail:
+//   "payload_corrupt"    payload_json is unreadable;
+//   "attachment_missing" an attachments row of the frozen payload is gone (never send fewer).
+struct UnsendableOutbound : std::runtime_error {
+  std::string name;
+  std::string detail_zh;
+  UnsendableOutbound(std::string n, std::string d)
+      : std::runtime_error("outbound unsendable: " + n), name(std::move(n)), detail_zh(std::move(d)) {}
+};
+
 // Plan for outbound.send (types.hpp OutboundSendPlan). Throws std::out_of_range when the row
-// does not exist (the job then gives up: jobs::Permanent).
+// does not exist (the job then gives up: jobs::Permanent) and UnsendableOutbound (above).
+// In-Reply-To/References: the frozen wire headers once freeze_send_headers ran, else resolved
+// now (frozen parent id, else one captured since, B2).
 OutboundSendPlan load_send_plan(db::Conn& c, int64_t outbound_id);
+
+// (additive, review RT-3/R6) Fixes the In-Reply-To/References of the outbound in payload_json
+// ("wire"), resolved now, unless already fixed. outbound.send calls it before its first POST,
+// after the optional parent Message-ID GET, so every attempt under the same Idempotency-Key
+// sends a byte-identical body. Returns true when it froze them now (false: already frozen,
+// row missing or payload unreadable).
+bool freeze_send_headers(db::Tx& tx, int64_t outbound_id);
 
 // Conditional `status IN ('queued','sending') → 'sending'` (retries re-enter while sending).
 // False when the outbound is canceled / already accepted / missing: the job stops silently.
+// (review SEC-4/R2) Also false — and the row is closed — when the send may no longer happen:
+//   * the sender is disabled or may no longer send as from_address_id (send-as rule,
+//     drafts.hpp) → mark_failed "sender_not_allowed";
+//   * the sender's own copy is gone (no is_shared_copy=0 non-draft message points at it) →
+//     status 'canceled' (+ local.canceled), nothing is sent.
 bool mark_sending(db::Tx& tx, int64_t outbound_id);
 
 // After POST /emails succeeded: resend_id, accepted_at=now, status 'scheduled' (when
 // `scheduled`) else 'accepted' (a webhook may already have moved it higher: then only
 // resend_id/accepted_at are set), event local.accepted. Enqueuing outbound.fetch_meta is the
-// job's responsibility (same transaction).
+// job's responsibility (same transaction). (review R9) A scheduled row that goes out now
+// (local scheduling) gets its copies' date set to now, so it sorts at its real send time.
 void mark_accepted(db::Tx& tx, int64_t outbound_id, std::string_view resend_id, bool scheduled);
 
 // Terminal failure: status 'failed', error_name = `name` (Resend error name), status_detail =
@@ -85,6 +112,12 @@ int64_t switch_to_local_schedule(db::Tx& tx, int64_t outbound_id);
 // ev.resend_id; if message_id_header is then still NULL, jobs::enqueue(outbound.fetch_meta,
 // {outbound_id}, dedupe out:meta:<id>, run_at now + 10 s) — the send job will see
 // mark_sending()==false and stop, so this is the only place that learns the resend id.
+// (review R9) A Resend-scheduled row that reaches 'sent' or later gets its copies' date set to
+// the event time. (review R10) "email.canceled" (Resend's last_event 'canceled', e.g. after a
+// cancel whose response was lost) on a Resend-scheduled row still accepted/scheduled completes
+// the cancel like finish_cancel_schedule: status 'canceled', the sender copy back to a draft.
+// A poll event (source_key "poll:…") whose type is already recorded for the outbound (e.g. from
+// its webhook) is a Duplicate (only the Message-ID it carries is still captured).
 EventApplyResult apply_outbound_event(db::Tx& tx, const OutboundEvent& ev);
 
 // Records the Message-ID (normalized) when not yet known: outbound.message_id_header and every
@@ -95,6 +128,8 @@ EventApplyResult apply_outbound_event(db::Tx& tx, const OutboundEvent& ev);
 // X-AzMail-Ref stripped) is deleted — its is_read/is_starred/labels OR-ed into the out copy,
 // its thread recomputed or deleted — and in_inbox=1 is set on the out copy; threads.changed is
 // emitted for the affected threads. No-op when already set to the same value.
+// (review R1/SEC-3) The id is sanitize_message_id'd (no-op when that leaves nothing); the late
+// loopback cleanup only folds 'in' messages whose From is the outbound's own identity.
 void set_outbound_message_id(db::Tx& tx, int64_t outbound_id, std::string_view msgid);
 
 // Outbound id by resend_id, else by uuid (B4). nullopt when neither matches.
@@ -111,6 +146,12 @@ struct ReconcileItem {
 };
 std::vector<ReconcileItem> outbound_to_reconcile(db::Conn& c, int64_t now_ms, int64_t max_age_ms,
                                                  int limit);
+// (additive, review R8) Same candidate set, round robin by id: up to `limit` rows with
+// id > after_id in id order, then (wrapping around) from the lowest id. outbound.reconcile keeps
+// the last polled id as its cursor, so every candidate is polled once per ceil(N / limit) runs —
+// rows whose Resend state never changes can no longer hold the batch forever.
+std::vector<ReconcileItem> outbound_to_reconcile_after(db::Conn& c, int64_t now_ms, int64_t max_age_ms,
+                                                       int limit, int64_t after_id);
 
 // ---- cancel / reschedule (API, net pool) -----------------------------------------------------
 // Three steps so the Resend call happens outside any transaction:
@@ -156,12 +197,42 @@ void finish_reschedule(db::Tx& tx, int64_t owner, int64_t outbound_id, int64_t s
 // POST /api/messages/:id/retry: the owner's message whose outbound is 'failed' gets a NEW
 // outbound row (new uuid = new Idempotency-Key, payload copied, status queued, send_after=now),
 // every copy re-pointed to it, outbound.send enqueued. Errors: 404 "not_found"; 409
-// "invalid_state" when the status is not failed.
+// "invalid_state" when the status is not failed. (review SEC-4) 403 "send_as_forbidden" when
+// the sender is disabled or may no longer send as the frozen From.
+// The new row starts with unfrozen wire headers (a new key may carry a parent id learned since).
+// The old row stays 'failed' and records "local.superseded" {retry_id}.
 SendResult retry_failed_send(db::Tx& tx, int64_t owner, int64_t message_id, int64_t now_ms);
 
 // POST /api/admin/outbox/:id/retry: same as retry_failed_send for any failed outbound (admin;
 // not owner-scoped). Returns the NEW outbound id (new row, new uuid); the original row stays
-// 'failed' (the API answers with the new OutboxRow). 404 "not_found"; 409 "invalid_state".
+// 'failed' (the API answers with the new OutboxRow). 404 "not_found"; 409 "invalid_state";
+// (review R4) 409 "invalid_state" also when no sender copy points at the row any more — it
+// was already retried (superseded) or the sender deleted the message — so a stale outbox
+// entry can never send the mail a second time; 403 "send_as_forbidden" (SEC-4, above).
 int64_t admin_retry_outbound(db::Tx& tx, int64_t outbound_id, int64_t now_ms);
+
+// ---- deleting the sender's copy of a pending send (review R2) ---------------------------------
+
+// What happens to the send of the owner's own (non-shared, non-draft) copy `message_id` when
+// that copy is trashed (CopyRemoval::Trash) or deleted forever / purged (CopyRemoval::Delete):
+//   None            nothing to do: no pending send, or an immediate send that is queued (undo
+//                   window) or sending while the copy is only trashed — it goes out and the copy
+//                   sits in Trash as sent mail;
+//   Canceled        not handed to Resend yet (status 'queued': a local schedule or a Resend
+//                   schedule not POSTed yet; with Delete also an immediate send in its undo
+//                   window) → canceled right here, in the caller's transaction: job canceled,
+//                   local.canceled, shared copies deleted; with Trash the copy is turned back
+//                   into a draft like undo_send (pre-freeze body, trashed_at cleared — the caller
+//                   then trashes it), with Delete it is left for the caller to delete;
+//   RemoteScheduled Resend holds a scheduled send (scheduled_via=resend, accepted/scheduled,
+//                   scheduled_at in the future): the cancel needs a network call, so the caller
+//                   refuses (409 "scheduled_send_pending": cancel the schedule first);
+//   InFlight        status 'sending' of a scheduled send (Trash or Delete) or of any send
+//                   (Delete): the caller refuses (409 "scheduled_send_pending" /
+//                   "send_in_progress").
+// Only the Canceled case changes anything.
+enum class PendingSend { None, Canceled, RemoteScheduled, InFlight };
+enum class CopyRemoval { Trash, Delete };
+PendingSend cancel_pending_send(db::Tx& tx, int64_t owner, int64_t message_id, CopyRemoval how, int64_t now_ms);
 
 }  // namespace azm::mail
