@@ -18,10 +18,13 @@ ExecStart=/usr/local/bin/azmail serve
 WorkingDirectory=/var/lib/azmail
 Restart=on-failure
 RestartSec=3
-# Graceful shutdown: acceptor closed, WebSockets get going_away, job runners get 25 s
-# (AZMAIL_SHUTDOWN_GRACE_SEC) — then systemd kills after 30 s.
+# Graceful shutdown on SIGTERM: acceptor closed, WebSockets get going_away, open requests drain,
+# running jobs finish — all of it within AZMAIL_SHUTDOWN_GRACE_SEC (default 25 s) in total. Jobs
+# still running after that are abandoned; their leases expire and they are retried after the restart.
+# TimeoutStopSec must stay >= AZMAIL_SHUTDOWN_GRACE_SEC + 10 s (thread joins, SQLite close); raise
+# both together. Otherwise systemd SIGKILLs and logs "Failed with result 'timeout'".
 KillSignal=SIGTERM
-TimeoutStopSec=30
+TimeoutStopSec=40
 LimitNOFILE=65536
 SyslogIdentifier=azmail
 UMask=0027

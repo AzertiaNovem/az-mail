@@ -24,6 +24,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "shuffle_events": False,
     "duplicate_webhooks": False,
     "split_delivery": False,
+    # How `received_for` is filled (README "Envelope"; real Resend behaviour is unverified, F4.1):
+    #   envelope = every local envelope recipient incl. bcc (idealised; the DESIGN assumption)
+    #   received = from the `for` clauses of the Received trace header, which names the recipient
+    #              only for a single-recipient delivery (Postfix/Exim/Sendmail) → [] otherwise
+    #   first    = the Received `for` clause names only the first recipient (RFC 5321 §4.4)
+    #   empty    = always []     omit = the field is absent from the API and the webhook
+    "received_for_mode": "envelope",
     "strip_custom_headers": False,   # drop X-* request headers from loopback copies
     "strip_thread_headers": False,   # also drop In-Reply-To / References from loopback copies
     "meta_delay": 0.0,               # seconds until GET /emails/{id}.message_id is non-null
@@ -37,6 +44,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "event_spacing": 0.15,           # seconds between consecutive events of one email
     "delivery_delay": 0.2,           # seconds from accept/fire to the first delivery event
 }
+
+RECEIVED_FOR_MODES = ("envelope", "received", "first", "empty", "omit")
+ENUM_CONFIG: dict[str, tuple[str, ...]] = {"received_for_mode": RECEIVED_FOR_MODES}
 
 
 @dataclass
@@ -118,7 +128,7 @@ class ReceivedEmail:
     cc: list[str]
     bcc: list[str]
     reply_to: list[str]
-    received_for: list[str]
+    received_for: list[str] | None  # None: the field is omitted (received_for_mode "omit")
     subject: str
     message_id: str
     html: str | None
@@ -267,6 +277,8 @@ class State:
                     value = [v.strip().lower() for v in value if v.strip()]
                 elif isinstance(default, str) and not isinstance(value, str):
                     raise ValueError(f"{key} must be a string")
+                if key in ENUM_CONFIG and value not in ENUM_CONFIG[key]:
+                    raise ValueError(f"{key} must be one of " + ", ".join(ENUM_CONFIG[key]))
                 self.config[key] = value
             return dict(self.config)
 

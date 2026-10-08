@@ -206,7 +206,14 @@ class ApiAndMockClientTests(unittest.TestCase):
         rec = self.client.received(since)
         self.assertEqual([r["id"] for r in rec], out["ids"])
         self.assertEqual(rec[0]["attachments"][0]["size"], 2)
-        self.assertTrue(self.client.received_raw(out["ids"][0]).startswith(b"Authentication-Results:"))
+        raw = self.client.received_raw(out["ids"][0])
+        # the MX trace header first (single recipient → FOR clause), then the message as built
+        head, _, rest = raw.partition(b"\r\nAuthentication-Results:")
+        self.assertTrue(head.startswith(b"Received: from mail.ext.test"), raw[:120])
+        self.assertIn(b"for <alice@corp.test>;", head.replace(b"\r\n        ", b" "))
+        self.assertTrue(rest, "Authentication-Results must follow the Received header")
+        self.assertEqual(rec[0]["raw_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(out["raw_sha256"], rec[0]["raw_sha256"])
         atts = http_request("GET", f"{self.base}/emails/receiving/{out['ids'][0]}/attachments",
                             headers={"Authorization": "Bearer re_k"})
         url = json.loads(atts.body)["data"][0]["download_url"]
@@ -350,8 +357,8 @@ class RunnerCliTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         names = [l.split()[0] for l in res.stdout.splitlines() if l.startswith("s")]
         self.assertEqual(names, sorted(names))
-        self.assertEqual([n[:3] for n in names], [f"s{i:02d}" for i in range(1, 36)])
-        self.assertIn("35 scenario(s)", res.stdout)
+        self.assertEqual([n[:3] for n in names], [f"s{i:02d}" for i in range(1, 37)])
+        self.assertIn("36 scenario(s)", res.stdout)
         res = self._run("--list", "-k", "s03,undo")
         self.assertTrue(all("s03" in l or "undo" in l.lower() for l in res.stdout.splitlines()[:-1]))
 

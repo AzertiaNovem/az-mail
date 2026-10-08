@@ -35,7 +35,8 @@ if __package__ in (None, ""):  # executed as a script: make the package importab
 
 from . import eml, svix  # noqa: E402
 from .s3 import S3Disk, S3Handler  # noqa: E402
-from .store import Attachment, Fault, IdemEntry, ReceivedEmail, SentEmail, State  # noqa: E402
+from .store import (RECEIVED_FOR_MODES, Attachment, Fault, IdemEntry, ReceivedEmail,  # noqa: E402
+                    SentEmail, State)
 
 DEFAULT_API_KEY = "re_mock_0000000000000000000000000000"
 DEFAULT_WEBHOOK_SECRET = "whsec_" + base64.b64encode(b"azmail-mock-webhook-secret-01").decode()
@@ -163,12 +164,14 @@ class MockResend:
     def __init__(self, *, api_key: str = DEFAULT_API_KEY, webhook_url: str = "",
                  webhook_secret: str = DEFAULT_WEBHOOK_SECRET, local_domains: list[str] | None = None,
                  time_scale: float = 1.0, meta_delay: float = 0.0, rate_limit: int = 10,
-                 reject_scheduled_attachments: bool = False,
+                 reject_scheduled_attachments: bool = False, received_for_mode: str = "envelope",
                  s3_access_key: str = DEFAULT_S3_ACCESS_KEY, s3_secret_key: str = DEFAULT_S3_SECRET_KEY,
                  s3_buckets: list[str] | None = None, s3_regions: list[str] | None = None,
                  s3_write_interval: float = 1.0, s3_max_object_mb: int = 200,
                  s3_data_dir: str | None = None, verbose: bool = False) -> None:
         svix.sign(webhook_secret, "msg_check", "0", b"")  # validates the secret format early
+        if received_for_mode not in RECEIVED_FOR_MODES:
+            raise ValueError("received_for_mode must be one of " + ", ".join(RECEIVED_FOR_MODES))
         self.api_key = api_key
         self.webhook_secret = webhook_secret
         self.time_scale = time_scale
@@ -179,6 +182,7 @@ class MockResend:
             "meta_delay": float(meta_delay),
             "rate_limit": int(rate_limit),
             "reject_scheduled_attachments": bool(reject_scheduled_attachments),
+            "received_for_mode": received_for_mode,
         })
         self.s3_keys = {s3_access_key: s3_secret_key}
         self.s3_regions = list(s3_regions or ["auto"])
@@ -533,20 +537,44 @@ class MockResend:
             authentication={"spf": "pass", "dkim": "pass", "dmarc": "pass"},
             source="loopback", sent_email_id=email.id, created_at=self.state.now(), notify=True)
 
+    def _received_for(self, group: list[str], raw: bytes, explicit: bool) -> list[str] | None:
+        """``received_for`` of one delivery (README "Envelope"): ``explicit`` = given by inject."""
+        mode = self.cfg["received_for_mode"]
+        if explicit or mode == "envelope":
+            return list(group)
+        if mode in ("received", "first"):
+            return eml.received_for_clauses(raw)
+        if mode == "empty":
+            return []
+        return None  # omit
+
     def _store_received(self, *, from_: str, to: list[str], cc: list[str], bcc: list[str],
                         reply_to: list[str], envelope: list[str], subject: str, message_id: str,
                         html: str | None, text: str | None, raw: bytes,
                         attachments: list[Attachment], authentication: dict[str, str] | None,
                         source: str, sent_email_id: str | None, created_at: float,
-                        notify: bool) -> list[ReceivedEmail]:
+                        notify: bool, explicit_received_for: bool = False) -> list[ReceivedEmail]:
         groups = [[r] for r in envelope] if self.cfg["split_delivery"] and envelope else [envelope]
+        if source == "loopback":  # Resend's own outbound relay hands the mail to its MX
+            relay, relay_ip = "a8-50.smtp-out.amazonses.com", "54.240.8.50"
+        else:
+            relay, relay_ip = "mail." + (eml.domain_of(eml.addr_of(from_)) or "mock.test"), "192.0.2.25"
+        first_mode = self.cfg["received_for_mode"] == "first"
         stored: list[ReceivedEmail] = []
         for group in groups:
+            # One SMTP transaction per delivery: the MX prepends its Received trace header. The FOR
+            # clause names the recipient of a single-recipient transaction; with several RCPT TO it
+            # is left out — or, in "first" mode, names only the first one (RFC 5321 §4.4).
+            for_rcpt = group[0] if group and (len(group) == 1 or first_mode) else None
+            graw = eml.prepend_header(raw, "Received", eml.received_header(
+                relay=relay, relay_ip=relay_ip, smtp_id=secrets.token_hex(16), date=created_at,
+                for_rcpt=for_rcpt))
             rec = ReceivedEmail(
                 id=str(uuid.uuid4()), created_at=created_at, from_=from_, to=list(to), cc=list(cc),
-                bcc=list(bcc), reply_to=list(reply_to), received_for=list(group), subject=subject,
-                message_id=eml.angle(message_id), html=html, text=text, headers=eml.headers_map(raw),
-                authentication=authentication, raw=raw,
+                bcc=list(bcc), reply_to=list(reply_to),
+                received_for=self._received_for(group, graw, explicit_received_for), subject=subject,
+                message_id=eml.angle(message_id), html=html, text=text, headers=eml.headers_map(graw),
+                authentication=authentication, raw=graw,
                 attachments=[Attachment(id=str(uuid.uuid4()), filename=a.filename,
                                         content_type=a.content_type, data=a.data,
                                         content_id=a.content_id, disposition=a.disposition)
@@ -561,24 +589,23 @@ class MockResend:
         return stored
 
     def notify_received(self, rec: ReceivedEmail, svix_id: str | None = None) -> str | None:
-        payload = {
-            "type": "email.received",
-            "created_at": iso_z(time.time()),
-            "data": {
-                "email_id": rec.id,
-                "created_at": iso_z(rec.created_at),
-                "from": rec.from_,
-                "to": rec.to,
-                "bcc": rec.bcc,
-                "cc": rec.cc,
-                "received_for": rec.received_for,
-                "message_id": rec.message_id,
-                "subject": rec.subject,
-                "attachments": [{"id": a.id, "filename": a.filename, "content_type": a.content_type,
-                                 "content_disposition": a.disposition, "content_id": a.content_id}
-                                for a in rec.attachments],
-            },
+        data: dict[str, Any] = {
+            "email_id": rec.id,
+            "created_at": iso_z(rec.created_at),
+            "from": rec.from_,
+            "to": rec.to,
+            "bcc": rec.bcc,
+            "cc": rec.cc,
+            "received_for": rec.received_for,
+            "message_id": rec.message_id,
+            "subject": rec.subject,
+            "attachments": [{"id": a.id, "filename": a.filename, "content_type": a.content_type,
+                             "content_disposition": a.disposition, "content_id": a.content_id}
+                            for a in rec.attachments],
         }
+        if rec.received_for is None:
+            del data["received_for"]
+        payload = {"type": "email.received", "created_at": iso_z(time.time()), "data": data}
         return self._send_webhook(payload, svix_id)
 
     def fire_due(self) -> list[str]:
@@ -608,9 +635,11 @@ class MockResend:
             return v
 
         to, cc, bcc, reply_to = addr_list("to"), addr_list("cc"), addr_list("bcc"), addr_list("reply_to")
+        # An explicit received_for (even []) is the envelope and is reported verbatim, whatever
+        # received_for_mode says; otherwise the envelope = the local to/cc/bcc recipients.
+        explicit = body.get("received_for") is not None
         received_for = [eml.addr_of(a) for a in addr_list("received_for")]
-        if not received_for:
-            received_for = []
+        if not explicit:
             for a in to + cc + bcc:
                 b = eml.addr_of(a)
                 if self.state.is_local(b) and b not in received_for:
@@ -658,9 +687,11 @@ class MockResend:
             from_=from_, to=to, cc=cc, bcc=bcc, reply_to=reply_to, envelope=received_for,
             subject=subject, message_id=message_id, html=html, text=text, raw=raw, attachments=parts,
             authentication={"spf": spf, "dkim": dkim, "dmarc": dmarc}, source="inject",
-            sent_email_id=None, created_at=created, notify=bool(body.get("webhook", True)))
+            sent_email_id=None, created_at=created, notify=bool(body.get("webhook", True)),
+            explicit_received_for=explicit)
         return {"ids": [r.id for r in recs], "message_id": message_id,
-                "raw_sha256": hashlib.sha256(raw).hexdigest()}
+                "received_for": [r.received_for for r in recs],
+                "raw_sha256": hashlib.sha256(recs[0].raw).hexdigest()}
 
     # -- download tokens ------------------------------------------------------------------------
     def new_download(self, kind: str, rec: ReceivedEmail, att: Attachment | None, host: str) -> tuple[str, float]:
@@ -1104,7 +1135,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not self.mock.cfg["raw_missing"]:
                 url, exp = self.mock.new_download("raw", rec, None, host)
                 raw = {"download_url": url, "expires_at": iso_z(exp)}
-            return {
+            out = {
                 "object": "email", "id": rec.id, "to": rec.to, "from": rec.from_,
                 "created_at": iso_z(rec.created_at), "subject": rec.subject, "html": html,
                 "html_format": fmt, "text": rec.text, "headers": rec.headers, "bcc": rec.bcc,
@@ -1114,6 +1145,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                                  "content_disposition": a.disposition, "content_id": a.content_id,
                                  "size": a.size} for a in rec.attachments],
             }
+            if rec.received_for is None:  # received_for_mode "omit"
+                del out["received_for"]
+            return out
         if rest[1] != "attachments" or len(rest) > 3:
             raise ApiErr(404, "not_found", "The requested endpoint does not exist.")
 
@@ -1375,6 +1409,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="seconds until GET /emails/{id}.message_id is non-null")
     ap.add_argument("--rate-limit", type=int, default=10, help="requests/second (0 = off)")
     ap.add_argument("--reject-scheduled-attachments", action="store_true")
+    ap.add_argument("--received-for-mode", choices=RECEIVED_FOR_MODES, default="envelope",
+                    help="how received_for is filled (README: Envelope); real Resend is unverified")
     ap.add_argument("--s3-port", type=int, default=-1, help="R2/S3 port (0 = random, -1 = off)")
     ap.add_argument("--s3-access-key", default=DEFAULT_S3_ACCESS_KEY)
     ap.add_argument("--s3-secret-key", default=DEFAULT_S3_SECRET_KEY)
@@ -1396,6 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
         local_domains=[d for d in args.local_domains.split(",") if d.strip()],
         time_scale=args.time_scale, meta_delay=args.meta_delay, rate_limit=args.rate_limit,
         reject_scheduled_attachments=args.reject_scheduled_attachments,
+        received_for_mode=args.received_for_mode,
         s3_access_key=args.s3_access_key, s3_secret_key=args.s3_secret_key,
         s3_buckets=[b.strip() for b in args.s3_bucket.split(",") if b.strip()],
         s3_regions=[r.strip() for r in args.s3_regions.split(",") if r.strip()],

@@ -228,6 +228,29 @@ class EmlTests(unittest.TestCase):
         self.assertIn(b"Content-ID: <img1>", raw)
         self.assertNotIn(b"Bcc", raw)
 
+    def test_received_trace_header(self) -> None:
+        raw = eml.build_eml(from_="a@x.test", to=["b@corp.test", "c@corp.test"], subject="s", text="x",
+                            message_id="<m@x>", date=0)
+        self.assertEqual(eml.received_for_clauses(raw), [])
+        multi = eml.prepend_header(raw, "Received", eml.received_header(
+            relay="mail.x.test", relay_ip="192.0.2.25", smtp_id="id1", date=0, for_rcpt=None))
+        one = eml.prepend_header(multi, "Received", eml.received_header(
+            relay="relay.corp.test", relay_ip="192.0.2.26", smtp_id="id2", date=0, for_rcpt="b@corp.test"))
+        self.assertTrue(one.startswith(b"Received: from relay.corp.test"))
+        self.assertEqual(eml.received_for_clauses(multi), [])
+        self.assertEqual(eml.received_for_clauses(one), ["b@corp.test"])
+        lines = one.split(b"\r\n\r\n", 1)[0].split(b"\r\n")
+        self.assertTrue(all(len(l) <= 78 for l in lines[:9]), lines[:9])  # folded like a real MTA
+        self.assertIn("by inbound-smtp.us-east-1.amazonaws.com with SMTP id id2 for <b@corp.test>;",
+                      eml.headers_map(one)["received"])  # first (newest) Received wins in the map
+        long_id = eml.received_header(relay="mail.x.test", relay_ip="192.0.2.25", smtp_id="f" * 32,
+                                      date=0, for_rcpt="someone.with.a.long.name@corp.test")
+        self.assertTrue(all(len(l) <= 78 for l in ("Received: " + long_id).split("\r\n")), long_id)
+        # bare and mixed-case addresses are recognised (and lowercased); duplicates collapse
+        hand = (b"Received: from h by mx for X@Corp.Test; Thu, 1 Jan 1970 00:00:00 GMT\r\n"
+                b"Received: from g by h for <x@corp.test>; Thu, 1 Jan 1970 00:00:00 GMT\r\n" + raw)
+        self.assertEqual(eml.received_for_clauses(hand), ["x@corp.test"])
+
     def test_subject_charset(self) -> None:
         raw = eml.build_eml(from_="a@x.test", to=["b@y.test"], subject="周报", text="x",
                             message_id="<m@x>", date=0, subject_charset="gb18030")
@@ -698,6 +721,75 @@ class ServerTests(unittest.TestCase):
                   "?limit=2&after=unknown"):
             with self.subTest(q=q):
                 self.assertEqual(self.api("GET", "/emails/receiving" + q)[0], 422)
+
+    def _loopback_copy(self, subject: str) -> tuple[dict[str, Any], dict[str, Any], bytes]:
+        """(webhook data, GET receiving/{id}, raw) of the loopback copy with ``subject``."""
+        self.wait_idle()
+        ev = next(e for e in self.events() if e["payload"]["type"] == "email.received"
+                  and e["payload"]["data"]["subject"] == subject)["payload"]["data"]
+        rid = ev["email_id"]
+        status, _, rec = self.api("GET", f"/emails/receiving/{rid}?html_format=cid")
+        self.assertEqual(status, 200, rec)
+        return ev, rec, self.ctl("GET", f"/_mock/received/{rid}/raw")
+
+    def test_received_for_modes(self) -> None:
+        rcpts = dict(to=["Bob <bob@corp.test>", "partner@ext.test"], cc=["carol@corp.test"],
+                     bcc=["dave@corp.test"])
+        expected = {"envelope": ["bob@corp.test", "carol@corp.test", "dave@corp.test"],
+                    "received": [], "first": ["bob@corp.test"], "empty": []}
+        for mode, want in expected.items():
+            with self.subTest(mode=mode):
+                self.ctl("POST", "/_mock/config", {"received_for_mode": mode})
+                subject = f"rf-{mode}"
+                self.assertEqual(self.send(subject=subject, **rcpts)[0], 200)
+                ev, rec, raw = self._loopback_copy(subject)
+                self.assertEqual(ev["received_for"], want)
+                self.assertEqual(rec["received_for"], want)
+                # The MX trace header: a FOR clause only in "first" mode (several RCPT TO).
+                self.assertTrue(raw.startswith(b"Received: from a8-50.smtp-out.amazonses.com"), raw[:80])
+                self.assertIn("inbound-smtp.us-east-1.amazonaws.com", rec["headers"]["received"])
+                self.assertEqual(b"for <bob@corp.test>" in raw, mode == "first")
+                self.assertEqual(eml.received_for_clauses(raw), ["bob@corp.test"] if mode == "first" else [])
+                self.assertNotIn(b"dave@corp.test", raw)  # BCC never in the raw message
+        # omit: the field is absent from the webhook and from GET (backend must cope)
+        self.ctl("POST", "/_mock/config", {"received_for_mode": "omit"})
+        self.assertEqual(self.send(subject="rf-omit", **rcpts)[0], 200)
+        ev, rec, _ = self._loopback_copy("rf-omit")
+        self.assertNotIn("received_for", ev)
+        self.assertNotIn("received_for", rec)
+        self.assertEqual(rec["to"], ["Bob <bob@corp.test>", "partner@ext.test"])  # headers stay
+        # a single-recipient delivery names its recipient: "received" mode reports it
+        self.ctl("POST", "/_mock/config", {"received_for_mode": "received"})
+        self.send(subject="rf-single", to="bob@corp.test")
+        ev, _, raw = self._loopback_copy("rf-single")
+        self.assertEqual(ev["received_for"], ["bob@corp.test"])
+        self.assertIn(b"for <bob@corp.test>;", raw.replace(b"\r\n        ", b" "))
+        # split delivery: one transaction (and one Received FOR clause) per recipient
+        self.ctl("POST", "/_mock/config", {"split_delivery": True})
+        out = self.ctl("POST", "/_mock/inbound", {"from": "p@ext.test", "to": ["alice@corp.test", "bob@corp.test"],
+                                                  "bcc": ["dave@corp.test"], "subject": "rf-split"})
+        self.assertEqual(sorted(r[0] for r in out["received_for"]),
+                         ["alice@corp.test", "bob@corp.test", "dave@corp.test"])
+        raws = [self.ctl("GET", f"/_mock/received/{i}/raw") for i in out["ids"]]
+        self.assertEqual([eml.received_for_clauses(r) for r in raws], out["received_for"])
+        self.assertEqual(len({hashlib.sha256(r).hexdigest() for r in raws}), 3)
+        self.assertEqual(out["raw_sha256"], hashlib.sha256(raws[0]).hexdigest())
+        # explicit received_for (even []) wins over the mode, and is not derived from to/cc/bcc
+        self.ctl("POST", "/_mock/config", {"split_delivery": False, "received_for_mode": "omit"})
+        for given in ([], ["carol@corp.test"]):
+            with self.subTest(given=given):
+                out = self.ctl("POST", "/_mock/inbound", {"from": "p@ext.test", "to": "alice@corp.test",
+                                                          "subject": "rf-explicit", "received_for": given})
+                self.assertEqual(out["received_for"], [given])
+                rec = self.api("GET", f"/emails/receiving/{out['ids'][0]}")[2]
+                self.assertEqual(rec["received_for"], given)
+        # validation, and reset back to the start value
+        status, _, body = self.http("POST", "/_mock/config", {"received_for_mode": "all"})
+        self.assertEqual(status, 400, body)
+        self.ctl("POST", "/_mock/reset", {"keep_data": True})
+        self.assertEqual(self.ctl("GET", "/_mock/config")["received_for_mode"], "envelope")
+        with self.assertRaises(ValueError):
+            MockResend(received_for_mode="all")
 
     def test_download_ttl_and_raw_missing(self) -> None:
         self.ctl("POST", "/_mock/config", {"download_ttl": 1, "raw_missing": True})

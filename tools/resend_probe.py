@@ -217,6 +217,9 @@ def main() -> int:
     p.record("F4.1 received_for / split delivery",
              receiving_emails=len(copies),
              received_for=[dd.get("received_for") for dd in details],
+             # Resend documents received_for as the Received headers' `for` clauses: compare
+             # (mock: tools/mock_resend/README.md "Envelope", received_for_mode)
+             received_headers=[(dd.get("headers") or {}).get("received") for dd in details],
              to=[dd.get("to") for dd in details], cc=[dd.get("cc") for dd in details],
              bcc=[dd.get("bcc") for dd in details],
              message_ids=[dd.get("message_id") for dd in details],

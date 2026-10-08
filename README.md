@@ -5,7 +5,7 @@
 ## 功能
 
 * **收件箱与会话**：按会话（thread）聚合，收件箱 / 已加星标 / 已定时 / 已发送 / 草稿 / 全部邮件 / 垃圾邮件 / 已删除；标签；归档、星标、已读未读、移入垃圾箱、永久删除等批量操作；Gmail 风格的翻页。
-* **写信**：富文本编辑器，多个写信窗口；自动保存草稿（冲突检测）；回复 / 全部回复 / 转发；附件（单个 25 MiB）与粘贴插图；签名；**撤销发送**（0–30 秒）；**定时发送**（可改期、取消）。
+* **写信**：富文本编辑器，多个写信窗口；自动保存草稿（冲突检测）；回复 / 全部回复 / 转发；附件（单个 25 MiB）与粘贴插图；签名（写信时插入编辑器，可删除或更换，按所见内容发送）；**撤销发送**（0–30 秒）；**定时发送**（可改期、取消）。
 * **团队地址**：成员邮箱 + 别名（如 `support@`），别名来信分发给所有成员；授权成员可以用别名身份回复，其他成员能在同一会话中看到回复。
 * **送达状态**：已发送 / 已送达 / 投递延迟 / 退信 / 被标记垃圾邮件 / 失败 / 已抑制，失败可重试。
 * **搜索**：中文全文检索（SQLite FTS5 trigram，2 字词也能搜），支持 `from:`、`to:`、`subject:`、`label:`、`has:attachment`、`in:`、`is:`、`before:`/`after:`、`newer_than:`、`larger:`、排除词和 `OR`。
@@ -45,9 +45,10 @@ cmake --preset mac-debug -S backend && cmake --build backend/build/mac-debug -j 
 cd frontend && pnpm install && pnpm build && pnpm test && pnpm lint
 # 模拟服务器自检（Svix / AWS SigV4 测试向量 + 主要流程）
 python3 -m tools.mock_resend.selftest
-# 端到端测试（35 个场景，随机端口启动模拟服务器和真实后端）
+# 端到端测试（36 个场景，随机端口启动模拟服务器和真实后端）
 python3 tests/e2e/run.py            # -k s03 只跑部分；--list 列出场景；--keep 保留日志
 python3 tests/e2e/test_harness.py   # 测试框架自身的单元测试
+AZMAIL_BIN=backend/build/mac-debug/azmail python3 tests/e2e/test_deploy.py   # 部署文件检查（Nginx、配置示例、systemd、前端部署脚本）
 ```
 
 ## 目录结构
@@ -58,9 +59,9 @@ backend/              C++20 后端（CMake 工程）：src/{app,http,ws,api,repo
 frontend/             React 19 + TypeScript + Vite 前端
 tools/mock_resend/    模拟 Resend API + 最小 R2（S3）服务，供开发和 E2E 使用
 tools/resend_probe.py 用真实 Resend 账号验证接口行为的探测脚本（手动运行）
-tests/e2e/            端到端测试（Python 标准库）：run.py、lib/、scenarios/s01–s35
-scripts/              dev.sh、seed_dev.py、build_backend.sh、build_frontend.sh
-deploy/               systemd 单元、配置示例、Nginx 配置、Ubuntu 24.04 构建容器
+tests/e2e/            端到端测试（Python 标准库）：run.py、lib/、scenarios/s01–s36、test_deploy.py
+scripts/              dev.sh、seed_dev.py、build_backend.sh、build_frontend.sh、deploy_frontend.sh
+deploy/               systemd 单元、配置示例、Nginx 配置（含代理头片段 nginx-azmail-proxy.conf）、Ubuntu 24.04 构建容器
 docs/                 设计、接口、契约与部署文档
 ```
 

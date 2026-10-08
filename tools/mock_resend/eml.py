@@ -169,6 +169,47 @@ def headers_map(raw: bytes) -> dict[str, str]:
     return out
 
 
+MX_HOST = "inbound-smtp.us-east-1.amazonaws.com"  # Resend's receiving MX (GET /domains)
+_FOR_RE = re.compile(r"\bfor\s+<?([^\s<>;]+@[^\s<>;]+?)>?\s*(?:;|$)", re.IGNORECASE)
+
+
+def received_header(*, relay: str, relay_ip: str, smtp_id: str, date: float,
+                    for_rcpt: str | None) -> str:
+    """Value of the Received trace header the receiving MX prepends (RFC 5321 §4.4), folded.
+
+    ``for_rcpt`` is the single address of the FOR clause, or None for no clause (what Postfix,
+    Exim and Sendmail write when the SMTP transaction had several RCPT TO).
+    """
+    fold = "\r\n        "
+    value = f"from {relay} ({relay} [{relay_ip}]){fold}by {MX_HOST}{fold}with SMTP id {smtp_id}"
+    if for_rcpt:
+        value += f"{fold}for <{for_rcpt}>"
+    return value + ";" + fold + email.utils.formatdate(date, localtime=False, usegmt=True)
+
+
+def prepend_header(raw: bytes, name: str, value: str) -> bytes:
+    """Adds a top-level header line in front (trace headers are prepended by each hop)."""
+    return f"{name}: {value}\r\n".encode("utf-8") + raw
+
+
+def received_for_clauses(raw: bytes) -> list[str]:
+    """Addresses named by the FOR clauses of all Received headers, in order, deduplicated.
+
+    This is how Resend documents ``received_for`` ("recipient addresses from the Received
+    headers' for clause").
+    """
+    out: list[str] = []
+    for name, value in header_lines(raw):
+        if name.lower() != "received":
+            continue
+        m = _FOR_RE.search(value)
+        if m:
+            addr = m.group(1).strip().lower()
+            if addr not in out:
+                out.append(addr)
+    return out
+
+
 def decode_words(value: str) -> str:
     """Decodes RFC 2047 encoded-words (unknown charsets are kept as-is)."""
     try:

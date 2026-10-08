@@ -95,13 +95,16 @@ sudo install -m 0755 backend/build/linux-release/azmail /usr/local/bin/azmail
 
 # 3. 配置（含密钥，权限 0640）
 sudo install -o root -g azmail -m 0640 deploy/azmail.env.example /etc/azmail/azmail.env
-sudo editor /etc/azmail/azmail.env          # 按第 5–7 节填写
-openssl rand -hex 32                         # 生成 AZMAIL_SECRET
+# 生成服务器密钥 AZMAIL_SECRET（openssl rand -hex 32）并直接写入配置文件
+sudo sed -i "s/^AZMAIL_SECRET=.*/AZMAIL_SECRET=$(openssl rand -hex 32)/" /etc/azmail/azmail.env
+sudo editor /etc/azmail/azmail.env          # 按第 5–7 节替换其余所有 CHANGE_ME_… 占位符
 
 # 4. systemd
 sudo install -m 0644 deploy/azmail.service /etc/systemd/system/azmail.service
 sudo systemctl daemon-reload
 ```
+
+示例配置中的 `CHANGE_ME_…` 只是占位符，**必须全部替换**：`AZMAIL_SECRET` 和 `RESEND_WEBHOOK_SECRET` 的占位符会被配置校验拒绝（服务无法启动，`azm doctor` 报 `[FAIL] configuration`），其余占位符会让 Resend / R2 检查失败。`AZMAIL_SECRET` 是附件和原始邮件签名下载链接的唯一密钥——使用公开的值（例如仓库里的示例值）时，任何人都能伪造任意用户的下载链接；`RESEND_WEBHOOK_SECRET` 泄露则可以伪造 webhook。
 
 命令行工具读取同一份配置：`sudo -u azmail azmail --env-file /etc/azmail/azmail.env <命令>`。下文简写为 `azm`：
 
@@ -119,10 +122,11 @@ alias azm='sudo -u azmail /usr/local/bin/azmail --env-file /etc/azmail/azmail.en
 |---|---|
 | `AZMAIL_PUBLIC_API_URL` | API 的公网地址，如 `https://mail-api.example.com`（签名下载链接用） |
 | `AZMAIL_CORS_ORIGINS` | 前端地址，如 `https://mail.example.com`（逗号分隔；WebSocket 也按它校验 Origin） |
-| `AZMAIL_SECRET` | 至少 32 字节随机数；更换后所有附件链接失效 |
+| `AZMAIL_SECRET` | 至少 32 字节随机数（`openssl rand -hex 32`，64 位十六进制）；示例中的占位符（含 `CHANGE_ME`）、过短或随机性不足的值会被拒绝；更换后所有附件链接失效 |
+| `AZMAIL_DATA_DIR` / `AZMAIL_DB_PATH` | **绝对路径**：`/var/lib/azmail` / `/var/lib/azmail/azmail.db`（示例中已填好，不要删掉）。程序内置默认值是相对路径 `data` / `data/azmail.db`，按当前目录解析：服务在 `/var/lib/azmail` 下运行，而 `azm` 命令沿用你所在的目录，会打开另一个（空的）数据库 |
 | `AZMAIL_LOCAL_DOMAINS` | 团队域名，如 `example.com` |
 | `RESEND_API_KEY` | Full access 权限的 Key（见第 6 节） |
-| `RESEND_WEBHOOK_SECRET` | Webhook 签名密钥 `whsec_…` |
+| `RESEND_WEBHOOK_SECRET` | Webhook 签名密钥 `whsec_…`（从 Resend 端点原样复制） |
 | `AZMAIL_BLOB_BACKEND` + `R2_*` | 文件存储（见第 7 节）；`local` 时不需要 R2 |
 
 常用可选项：
@@ -131,7 +135,7 @@ alias azm='sudo -u azmail /usr/local/bin/azmail --env-file /etc/azmail/azmail.en
 |---|---|---|
 | `AZMAIL_LISTEN_ADDRESS` / `AZMAIL_PORT` | `127.0.0.1` / `8080` | 只监听本机，由 Nginx 对外 |
 | `AZMAIL_TRUSTED_PROXIES` | `127.0.0.1,::1` | 只信任这些代理的 `X-Forwarded-For` |
-| `AZMAIL_DATA_DIR` / `AZMAIL_DB_PATH` | `/var/lib/azmail` / `…/azmail.db` | 数据目录 / 数据库 |
+| `AZMAIL_SHUTDOWN_GRACE_SEC` | `25` | 优雅停机总时限；systemd `TimeoutStopSec`（40）必须比它至少大 10 秒 |
 | `AZMAIL_UNDO_SEND_SECONDS` | `5` | 新用户默认撤销发送时间（0/5/10/20/30） |
 | `AZMAIL_SCHEDULE_MODE` | `resend` | `local` = 定时发送一律由本服务执行 |
 | `AZMAIL_FILES_DELIVERY` | `proxy` | `redirect` = 302 跳转到 R2 预签名链接 |
@@ -211,7 +215,7 @@ journalctl -u azmail -f
 curl -s http://127.0.0.1:8080/api/health          # {"status":"ok",...}
 ```
 
-systemd 单元（`deploy/azmail.service`）以 `azmail` 用户运行，`ProtectSystem=strict`，只有 `/var/lib/azmail` 可写；`TimeoutStopSec=30`（后端优雅停机最多等 25 秒）。
+systemd 单元（`deploy/azmail.service`）以 `azmail` 用户运行，`ProtectSystem=strict`，只有 `/var/lib/azmail` 可写；`TimeoutStopSec=40`：后端的整个优雅停机（关闭连接、等待正在运行的后台任务）不超过 `AZMAIL_SHUTDOWN_GRACE_SEC`（默认 25 秒），之后仍未结束的任务被放弃，租约到期后在重启后重试；剩下的时间留给线程退出和关闭数据库。调大 `AZMAIL_SHUTDOWN_GRACE_SEC` 时同步调大 `TimeoutStopSec`（至少多 10 秒），否则 systemd 会强制结束进程并记录 `Failed with result 'timeout'`。
 
 Nginx：
 
@@ -224,6 +228,7 @@ for host in mail.example.com mail-api.example.com; do
        --pre-hook "systemctl stop nginx" --post-hook "systemctl start nginx"
 done
 
+sudo install -m 0644 deploy/nginx-azmail-proxy.conf /etc/nginx/snippets/azmail-proxy.conf   # 代理头
 sudo cp deploy/nginx-api.conf      /etc/nginx/sites-available/azmail-api.conf
 sudo cp deploy/nginx-frontend.conf /etc/nginx/sites-available/azmail-web.conf
 sudo editor /etc/nginx/sites-available/azmail-*.conf   # 替换域名、证书路径、CSP 中的 API 地址
@@ -234,7 +239,10 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Ubuntu 24.04 的 nginx 是 1.24，配置里使用 `listen 443 ssl http2;` 写法（`http2 on;` 需要 1.25.1+）。
 
-* **API**（`nginx-api.conf`）：TLS；反代到 `127.0.0.1:8080`；`/api/ws` 带 `Upgrade`/`Connection` 头且 `proxy_read_timeout 1h`；`client_max_body_size 30m`（附件上限 25 MiB）；传递 `X-Forwarded-For` / `X-Forwarded-Proto`；JSON gzip；访问日志**不记录查询串**（签名链接的签名在查询串里）。
+* **API**（`nginx-api.conf`）：TLS；反代到 `127.0.0.1:8080`；`/api/ws` 带 `Upgrade`/`Connection` 头且 `proxy_read_timeout 1h`；`client_max_body_size 30m`（附件上限 25 MiB）；JSON gzip。
+  * **代理头**：每个反代的 `location` 都 `include /etc/nginx/snippets/azmail-proxy.conf;`（`deploy/nginx-azmail-proxy.conf`：`Host`、`X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Proto`）。原因是 nginx 的继承规则：一个 `location` 只要有一条自己的 `proxy_set_header`（这里每个都有：`Upgrade`/`Connection`），`server` 级别的 `proxy_set_header` 在其中就**全部失效**。少了这些头，后端看到的所有客户端都是 `127.0.0.1`：按 IP 的登录限流（`AZMAIL_LOGIN_MAX_PER_IP`）会把整个团队当成一个 IP，全团队 20 次输错密码后所有人登录都返回 429。**新增 `location` 时也要 include 这个文件。**
+  * `X-Forwarded-For` 被覆盖为 `$remote_addr`，客户端自带的值不会传给后端（否则可以伪造 IP 绕过限流）。Nginx 前面如果还有 CDN / 负载均衡，先用 realip 模块（`set_real_ip_from` + `real_ip_header X-Forwarded-For`）还原真实客户端地址。验证：从外网访问后，`journalctl -u azmail` 访问日志中的 `ip` 应是浏览器的公网地址，而不是 `127.0.0.1`。
+  * **日志**：访问日志**不记录查询串**（签名链接的签名在查询串里）。错误日志无法去掉查询串（上游超时、连接重置、重启期间的 502 都会写出完整请求行），所以 `/api/files/`（附件 / 原始邮件签名链接）的错误日志级别为 `crit`，下载失败请看 `journalctl -u azmail`。其余 nginx 日志保持 Ubuntu 默认的 `0640 root:adm` 并按默认规则轮转，不要把它们发送到权限更宽的日志系统。
 * **前端**（`nginx-frontend.conf`）：SPA 回退到 `index.html`；`index.html` 与 `/config.js` 设置 `Cache-Control: no-store`，`/assets/*` 一年 `immutable`；严格 CSP：
   `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https://mail-api.example.com wss://mail-api.example.com; font-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'`。
   `img-src` 必须包含 `https:`：邮件正文在沙箱 iframe（srcdoc）中显示，会继承页面 CSP，再由 iframe 内的 CSP 收紧。
@@ -242,12 +250,19 @@ Ubuntu 24.04 的 nginx 是 1.24，配置里使用 `listen 443 ssl http2;` 写法
 ## 10. 部署前端
 
 ```bash
-sudo install -d /var/www/azmail
-sudo rsync -a --delete frontend/dist/ /var/www/azmail/
-echo 'window.__AZMAIL_CONFIG__ = { apiBase: "https://mail-api.example.com" };' | sudo tee /var/www/azmail/config.js
+# 首次部署：写入本环境的 /var/www/azmail/config.js，再复制构建产物
+sudo scripts/deploy_frontend.sh --api-base https://mail-api.example.com
+# 以后升级：不带 --api-base，保留现有的 config.js
+sudo scripts/deploy_frontend.sh
 ```
 
-`config.js` 由每个环境单独维护（部署脚本里 `rsync` 后再写入，或把它排除在 `--delete` 之外）。前端不从 CDN 加载任何字体或图标（Google Fonts 在中国大陆不可用）。
+`config.js` 由每个环境单独维护，**任何复制都不能覆盖它**：每个构建里都带着开发用的默认 `config.js`（`apiBase: ""`，即同源），覆盖后前端会把 `/api/…` 请求发到静态站点（得到 `index.html` 或 405），所有用户都无法登录。`scripts/deploy_frontend.sh`（`--root` / `--dist` 可改目录，`--dry-run` 只显示变更）执行的是：
+
+```bash
+sudo rsync -a --delete --exclude=/config.js frontend/dist/ /var/www/azmail/
+```
+
+手工复制时必须带 `--exclude=/config.js`：它同时防止覆盖和删除；只加保护规则（`--filter='P config.js'`）仍会被构建里的同名文件覆盖。前端不从 CDN 加载任何字体或图标（Google Fonts 在中国大陆不可用）。
 
 ## 11. 备份与恢复
 
@@ -267,7 +282,7 @@ rsync -a /var/lib/azmail/blobs/ backup-host:/srv/azmail-blobs/
 
 恢复：`systemctl stop azmail` → 把备份的 `.db` 复制为 `/var/lib/azmail/azmail.db`（属主 `azmail`，删除旧的 `-wal`/`-shm` 文件）→ 恢复文件 → `azm migrate` → `systemctl start azmail` → `azm doctor`。搜索索引异常时可运行 `azm reindex`。
 
-注意：Resend 收件只保留 30 天。服务停机超过 30 天会丢失这期间的来信（管理后台会提示轮询发现的缺口）。
+注意：Resend 收件只保留 30 天。服务停机超过 30 天会丢失这期间的来信。轮询发现缺口时管理后台“统计”页会显示轮询缺口警告（`poll_gap`）：要么补收了早于上次同步位置、却从未通过 webhook 收到的邮件（通常说明 webhook 没有送达，见第 13 节），要么找不到上次的同步位置（超过 30 天保留期或 20 页），期间的邮件可能已经丢失。
 
 ## 12. 升级
 
@@ -282,7 +297,7 @@ sudo systemctl start azmail
 curl -s https://mail-api.example.com/api/health
 ```
 
-前端：重新构建后 `rsync` 到 `/var/www/azmail/`（保留 `config.js`）。哈希文件名的资源可以长期缓存，`index.html` 不缓存，用户刷新即得到新版本。数据库迁移只增不减；回滚二进制前请先恢复升级前的数据库备份。停机期间到达的邮件不会丢：webhook 会重试，轮询也会补上。
+前端：重新构建后运行 `sudo scripts/deploy_frontend.sh`（不带 `--api-base` 时保留现有的 `config.js`；手工复制必须带 `--exclude=/config.js`，见第 10 节）。哈希文件名的资源可以长期缓存，`index.html` 不缓存，用户刷新即得到新版本。数据库迁移只增不减；回滚二进制前请先恢复升级前的数据库备份。停机期间到达的邮件不会丢：webhook 会重试，轮询也会补上。
 
 ## 13. 故障排查
 
@@ -301,12 +316,18 @@ curl -s https://mail-api.example.com/api/health
 | R2 `SignatureDoesNotMatch` / `AccessDenied` | Access Key/Secret 错误，或令牌未授权该存储桶；`R2_ENDPOINT` 应为 S3 API 地址（不是自定义域名），区域固定为 `auto` |
 | R2 `NoSuchBucket` | `R2_BUCKET` 名称错误或管辖区不对（欧盟存储桶需要 `.eu.` 地址） |
 | 附件下载很慢（中国大陆） | 使用 `AZMAIL_FILES_DELIVERY=proxy`（默认）；适当增大 `AZMAIL_FILE_CACHE_MB` |
-| 实时更新不工作（新邮件不自动出现） | 检查 Nginx `/api/ws` 的 Upgrade 配置和 `proxy_read_timeout`；`AZMAIL_CORS_ORIGINS` 必须包含前端地址（WebSocket 校验 Origin）。断线时前端每 60 秒轮询，功能不受影响 |
+| 实时更新不工作（新邮件不自动出现） | 检查 Nginx `/api/ws` 的 Upgrade 配置和 `proxy_read_timeout`；`AZMAIL_CORS_ORIGINS` 必须包含前端地址（WebSocket 校验 Origin）。WebSocket 断开期间**只有未读计数**每 60 秒轮询一次；邮件列表和会话不会自动刷新，要切换窗口、切换页面或刷新才会出现新邮件（看起来像“收不到信”），所以必须修好 WebSocket |
 | 浏览器报 CORS 错误 | `AZMAIL_CORS_ORIGINS` 与浏览器地址栏的 scheme/域名/端口必须完全一致 |
+| **所有用户**登录都返回 429 `too_many_attempts` / 后端日志里的 `ip` 全是 `127.0.0.1` | Nginx 没有把客户端地址传给后端，整个团队共用一个按 IP 的限流窗口：确认 `/etc/nginx/snippets/azmail-proxy.conf` 存在且每个反代 `location` 都 include 了它（第 9 节）；`AZMAIL_TRUSTED_PROXIES` 包含 Nginx 的地址。窗口（`AZMAIL_LOGIN_WINDOW_SEC`，默认 15 分钟）过后自动恢复 |
+| 升级前端后所有人都无法登录（接口返回网页而不是 JSON） | `/var/www/azmail/config.js` 被构建里的默认值（`apiBase: ""`）覆盖了：`sudo scripts/deploy_frontend.sh --api-base https://mail-api.example.com`；以后用不带 `--api-base` 的脚本或 `rsync --exclude=/config.js` 升级（第 10 节） |
+| 启动失败 / `azm doctor` 报 `[FAIL] configuration`：`AZMAIL_SECRET still holds the example placeholder`、`is too short`、`has too little entropy`，或 `RESEND_WEBHOOK_SECRET must start with 'whsec_'` / `is not a real signing secret` | 示例配置里的 `CHANGE_ME_…` 占位符没有替换（第 4 节）。`AZMAIL_SECRET` 用 `openssl rand -hex 32` 生成（64 位十六进制）；webhook 密钥从 Resend 端点页面原样复制 |
+| 停止 / 重启时 systemd 记录 `Failed with result 'timeout'` | `TimeoutStopSec` 没有比 `AZMAIL_SHUTDOWN_GRACE_SEC` 大至少 10 秒（第 9 节）；被强制结束的后台任务会在租约到期后自动重试 |
+| 管理后台“统计”页显示轮询缺口警告（`poll_gap`） | 有邮件只靠轮询才收到：按上面“Webhook 返回 401”一行检查 webhook，并在“Webhook 事件”中确认事件恢复；“未找到上次同步位置”表示服务停机太久，期间的邮件可能已丢失（第 11 节） |
+| 发出的邮件签名重复，或选了“不使用签名”仍带签名 | 签名由前端写信编辑器插入正文（写信时可以删除或更换），服务器按编辑器中的内容发送、不再另外追加。仍出现时说明浏览器在用旧版前端：刷新页面（`index.html` 不缓存） |
 | 启动失败：FTS5 / trigram | SQLite 版本过旧；Ubuntu 24.04 自带的 3.45 满足要求 |
 | `database is locked` / 503 | 数据库放在了网络盘，或有外部进程长时间占用；数据库必须在本地磁盘 |
 
-更多诊断：`azm doctor`、`journalctl -u azmail --since -1h`、管理后台“统计”（队列、失败数、最近一次 webhook / 轮询时间、存储用量）。
+更多诊断：`azm doctor`、`journalctl -u azmail --since -1h`、管理后台“统计”（队列与失败数；周期任务（`queue.periodic`：轮询、对账、清理等，单独列出，不算待处理积压）；轮询缺口警告（`poll_gap`）；最近一次 webhook / 轮询时间；存储用量）。
 
 ## 14. 用真实 Resend 验证假设（tools/resend_probe.py）
 
@@ -321,7 +342,7 @@ python3 tools/resend_probe.py --domain probe.example.com --yes --sending-key re_
 
 脚本只给测试域名下的地址发少量邮件（可选 `--external` 一个外部邮箱），检查并打印：
 
-1. `received_for` 的内容，以及一封邮件发给同域多个收件人（含抄送、密送）时是否被拆成多封（split delivery）；
+1. `received_for` 的内容（与原始邮件 `Received` 头的 `for` 子句对照），以及一封邮件发给同域多个收件人（含抄送、密送）时是否被拆成多封（split delivery）。这一项决定团队成员能否收到密送：后端以 `received_for` 为准投递，为空时退回按 To/Cc 投递（只出现在信封里的密送收件人收不到），只列出部分收件人时其余收件人收不到；
 2. 收件详情的 `headers` 是否包含 `in-reply-to`、`references` 和自定义 `X-*` 头（如 `X-AzMail-Ref`），名称是否小写；
 3. 收件列表的排序（是否最新在前）以及 `after` / `before` 游标的方向；
 4. 带附件的定时发送是否被接受；
@@ -331,10 +352,11 @@ python3 tools/resend_probe.py --domain probe.example.com --yes --sending-key re_
 8. 收信接口需要哪种 Key 权限（用 `--sending-key` 对比只能发信的 Key）；
 9. 空主题是否被接受。
 
-另外还会检查：缺少 User-Agent 时的 403 1010、`Idempotency-Key` 的重放与冲突、限流响应头、`html_format=cid`、原始邮件下载链接，以及附件 `download_url` 带 `Authorization` 头时的表现。结果与模拟服务器的假设（`tools/mock_resend/README.md`）不一致时，请记录到 issue 并相应调整模拟服务器和后端——例如定时邮件不接受附件时后端会自动改为本地定时，`headers` 中没有 `X-AzMail-Ref` 时依靠 Message-ID 识别回环邮件。
+另外还会检查：缺少 User-Agent 时的 403 1010、`Idempotency-Key` 的重放与冲突、限流响应头、`html_format=cid`、原始邮件下载链接，以及附件 `download_url` 带 `Authorization` 头时的表现。结果与模拟服务器的假设（`tools/mock_resend/README.md`）不一致时，请记录到 issue 并相应调整模拟服务器和后端——例如定时邮件不接受附件时后端会自动改为本地定时，`headers` 中没有 `X-AzMail-Ref` 时依靠 Message-ID 识别回环邮件。模拟服务器默认假设 `received_for` 列出全部本域收件人（含密送）；`received_for_mode` 可以模拟其他结果（`received` = 只取单收件人投递的 `for` 子句、`first` = 只有第一个收件人、`empty`、`omit`），端到端场景 36 用它验证空值时按 To/Cc 回退。
 
 ## 附：开发与测试环境
 
 * 本地开发：`scripts/dev.sh`（模拟 Resend/R2 + 后端 + 演示数据 + Vite），见根目录 README。
 * 端到端测试：`python3 tests/e2e/run.py`（随机端口启动模拟服务器和后端，默认使用模拟 R2，结束后再用本地存储跑一组冒烟测试）。
 * 模拟服务器自检：`python3 -m tools.mock_resend.selftest`。
+* 部署文件检查：`AZMAIL_BIN=backend/build/mac-debug/azmail python3 tests/e2e/test_deploy.py`（Nginx 代理头与日志、配置示例的占位符、systemd 停机超时、前端部署脚本；用真实二进制确认未修改的配置示例无法通过校验）。

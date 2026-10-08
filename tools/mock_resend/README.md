@@ -29,6 +29,7 @@ Files: `server.py` (HTTP servers, Resend emulation, control endpoints), `store.p
 | `--meta-delay` | `0` | seconds until `GET /emails/{id}.message_id` is non-null |
 | `--rate-limit` | `10` | requests/second, fixed window (`0` = off) |
 | `--reject-scheduled-attachments` | off | 422 for scheduled sends with attachments |
+| `--received-for-mode` | `envelope` | how inbound `received_for` is filled (see *Envelope* below) |
 | `--s3-port` | `-1` (off) | R2/S3 listener (`0` = random) |
 | `--s3-access-key` / `--s3-secret-key` | dev values | the only accepted SigV4 credentials |
 | `--s3-bucket` | `azmail` | comma list of existing buckets |
@@ -90,10 +91,45 @@ Scheduled sends emit `email.scheduled` first. Event `data` carries `email_id`, `
 **Loopback** (recipients on `--local-domains`): a raw .eml is built (`eml.py`: Message-ID = the
 send's message id, `In-Reply-To` / `References` / `X-AzMail-Ref` and other request headers,
 attachments with inline parts as `multipart/related`, RFC 2047 subject, RFC 2231 filenames,
-`Authentication-Results` pass) and stored as a received email with `received_for` = the local
-envelope recipients **including bcc**, `headers` lowercased, `authentication` all `pass`, and the
-send's full `bcc` list exposed on every copy (worst case — AZ Mail must drop it, DESIGN C2). An
-`email.received` webhook follows.
+`Authentication-Results` pass), the receiving MX prepends its `Received` trace header (see
+*Envelope*), and it is stored as a received email with `received_for` per `received_for_mode`
+(default: the local envelope recipients **including bcc**), `headers` lowercased, `authentication`
+all `pass`, and the send's full `bcc` list exposed on every copy (worst case — AZ Mail must drop
+it, DESIGN C2). An `email.received` webhook follows.
+
+### Envelope (`received_for`)
+
+Resend documents `received_for` as the recipient addresses taken from the **`for` clause of the
+`Received` headers**. Whether that is the complete envelope is *unverified* (DESIGN F4.1;
+`tools/resend_probe.py` check 1 records `received_for` next to the raw `Received` headers): a
+receiving MTA names the recipient in its `for` clause for a single-recipient SMTP transaction, but
+Postfix, Exim and Sendmail leave the clause out when one transaction carries several `RCPT TO`, and
+RFC 5321 §4.4 allows at most one address there. AZ Mail routes by `received_for` and falls back to
+the `To` ∪ `Cc` headers only when it is empty (DESIGN C1), so the difference matters:
+
+| Resend gives | AZ Mail delivers to |
+|---|---|
+| every local envelope recipient | everyone, Bcc'd team members included |
+| `[]` or no field | the local `To`/`Cc` addresses — a Bcc-only team member gets nothing |
+| only some recipients | only those — the others get nothing (nothing is logged as unroutable) |
+
+The mock prepends one `Received: from … by inbound-smtp.us-east-1.amazonaws.com with SMTP id …
+[for <rcpt>]; <date>` header per delivery (one delivery = one SMTP transaction; with
+`split_delivery` one per envelope recipient, so the copies' raw files differ only in it) with a
+`for` clause only when the delivery has exactly one recipient. `received_for_mode` then decides
+what the API reports:
+
+| `received_for_mode` | `received_for` |
+|---|---|
+| `envelope` (default) | all local envelope recipients incl. bcc — the idealised assumption the rest of the suite runs on |
+| `received` | the `for` clauses of the stored raw message: `[rcpt]` for a single-recipient (or split) delivery, `[]` otherwise |
+| `first` | the `for` clause names the first recipient even when there are several → a partial list |
+| `empty` | always `[]` |
+| `omit` | the field is absent from `GET /emails/receiving/{id}` and the `email.received` webhook |
+
+An explicit `received_for` in `POST /_mock/inbound` (even `[]`) is used as the envelope and
+reported verbatim whatever the mode. E2E 36 (`tests/e2e/scenarios/s36_envelope_fallback.py`)
+covers `omit`, `received` and `received` + `split_delivery` against the real backend.
 
 ### Receiving
 
@@ -123,13 +159,13 @@ in order by one worker; each delivery is attempted at 0 s, +1 s, +3 s (× `--tim
 |---|---|---|
 | `GET /_mock/health` | – | `{ok:true}` |
 | `GET /_mock/state` | – | `{seq, now_ms, offset, config, emails, received, pending_webhooks, idle, faults, …}` |
-| `GET/POST /_mock/config` | `{webhooks_enabled, webhook_url, shuffle_events, duplicate_webhooks, split_delivery, strip_custom_headers, strip_thread_headers, meta_delay, raw_missing, reject_scheduled_attachments, honor_message_id, verify_from_domain, local_domains, rate_limit, download_ttl, event_spacing, delivery_delay}` (partial) | merge config |
+| `GET/POST /_mock/config` | `{webhooks_enabled, webhook_url, shuffle_events, duplicate_webhooks, split_delivery, received_for_mode, strip_custom_headers, strip_thread_headers, meta_delay, raw_missing, reject_scheduled_attachments, honor_message_id, verify_from_domain, local_domains, rate_limit, download_ttl, event_spacing, delivery_delay}` (partial) | merge config |
 | `GET/POST /_mock/faults` | `[{match:"POST /emails", status, name, message, retry_after, body, timeout, delay, close, count, target}]` or `{faults, append}` | replace (or append) the fault list |
 | `POST /_mock/advance?seconds=N` | – | move the mock clock; fires due scheduled sends → `{now_ms, offset, fired:[ids]}` |
 | `GET /_mock/sent?since=&method=&path=` | – | `{seq, requests:[{seq, at, method, path, query, user_agent, idempotency_key, auth, status, name, replayed, fault, email_id, body}], emails:[…]}` (attachment bytes replaced by length + sha256) |
 | `GET /_mock/emails/{id}` | – | full sent email incl. `message_id`, events, attachment hashes |
 | `GET /_mock/received[?since]`, `/_mock/received/{id}[?raw=1]`, `/_mock/received/{id}/raw` | – | stored inbound mail / raw .eml |
-| `POST /_mock/inbound` | `{from, to, cc, bcc, reply_to, received_for, subject, subject_charset, html, text, attachments:[{filename, content_type, content(b64)\|text, content_id, inline}], headers, message_id, in_reply_to, references, spf, dkim, dmarc, date, webhook}` | inject external mail → `{ids, message_id, raw_sha256}` (one id per envelope recipient with `split_delivery`) |
+| `POST /_mock/inbound` | `{from, to, cc, bcc, reply_to, received_for, subject, subject_charset, html, text, attachments:[{filename, content_type, content(b64)\|text, content_id, inline}], headers, message_id, in_reply_to, references, spf, dkim, dmarc, date, webhook}` | inject external mail → `{ids, message_id, received_for:[per id], raw_sha256 (of the first copy)}` (one id per envelope recipient with `split_delivery`; envelope = `received_for` if given, even `[]`, else the local to/cc/bcc) |
 | `POST /_mock/webhook` | `{email_id[, type, svix_id]}` or `{payload[, svix_id]}` | (re-)send a signed event |
 | `GET /_mock/webhooks?since=&wait=1` | – | delivery attempts log |
 | `GET /_mock/violations` | – | Authorization headers seen on download URLs |
@@ -175,3 +211,6 @@ for signing *and* server-side verification, and runs the flows above against in-
 * Attachments by `path` are not supported.
 * Delivery events are synthesized per email from recipient prefixes; open/click events only via
   `POST /_mock/webhook`.
+* `received_for` defaults to the complete local envelope (incl. bcc). Real Resend derives it from
+  `Received` `for` clauses and may report fewer addresses or none for multi-recipient mail
+  (unverified, see *Envelope*); use `received_for_mode` to emulate that.
