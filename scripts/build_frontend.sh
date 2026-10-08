@@ -2,10 +2,11 @@
 # Production build of the AZ Mail frontend (one build for every environment).
 #
 # Usage: scripts/build_frontend.sh [--api-base URL] [--skip-checks]
-#   --api-base URL  also write dist/config.js with this API origin (e.g. https://mail-api.example.com);
-#                   normally /config.js is provided per environment by Nginx (DESIGN E2)
+#   --api-base URL  also write dist/config.js with this API origin (e.g. https://mail-api.example.com),
+#                   for serving dist/ as is; a deployed web root keeps its own /config.js (DESIGN E2)
 #   --skip-checks   skip `pnpm test` and `pnpm lint`
-# Output: frontend/dist/ → copy to the web root (deploy/nginx-frontend.conf).
+# Output: frontend/dist/ → scripts/deploy_frontend.sh copies it to the web root
+#         (deploy/nginx-frontend.conf) and never overwrites the environment's config.js.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,7 +18,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --api-base) API_BASE="$2"; shift ;;
     --skip-checks) CHECKS=0 ;;
-    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,9p' "${ROOT}/scripts/build_frontend.sh" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift

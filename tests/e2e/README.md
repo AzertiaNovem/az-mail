@@ -1,6 +1,6 @@
 # 端到端测试（tests/e2e）
 
-只依赖 Python 标准库（≥ 3.10）。`run.py` 在临时目录里用随机端口启动模拟 Resend/R2（`tools/mock_resend`）和**真实的** `azmail` 二进制，通过命令行完成初始化（`migrate`、`add-domain`、`create-user --admin`，密码走标准输入），然后按顺序执行 `scenarios/` 中的场景（DESIGN §6 的 01–34 和附录 A 的 35）。所有场景共享一个环境；每个场景开始前模拟服务器会恢复默认配置（数据保留）。
+只依赖 Python 标准库（≥ 3.10）。`run.py` 在临时目录里用随机端口启动模拟 Resend/R2（`tools/mock_resend`）和**真实的** `azmail` 二进制，通过命令行完成初始化（`migrate`、`add-domain`、`create-user --admin`，密码走标准输入），然后按顺序执行 `scenarios/` 中的场景（DESIGN §6 的 01–34、附录 A 的 35，以及 36：Resend 的 `received_for` 缺失或为空时按 To/Cc 投递）。所有场景共享一个环境；每个场景开始前模拟服务器会恢复默认配置（数据保留）。
 
 ```bash
 python3 tests/e2e/run.py                        # 全部场景（R2 存储，模拟 S3）+ 本地存储冒烟测试
@@ -31,5 +31,6 @@ python3 tests/e2e/run.py --azmail-bin path/to/azmail   # 默认 $AZMAIL_BIN 或 
 | `scenarios/sNN_*.py` | 每个文件一个场景：`TITLE`、可选 `SMOKE` / `TIMEOUT`、`run(ctx)` |
 | `test_mock.py` | 运行模拟服务器自检 |
 | `test_harness.py` | 测试框架自身的单元测试（不需要后端） |
+| `test_deploy.py` | 部署文件检查：Nginx 代理头继承与日志、配置示例的占位符与路径、systemd 停机超时、`scripts/deploy_frontend.sh` 保留 `config.js`；设置 `AZMAIL_BIN` 时还用真实二进制运行 `doctor --offline` |
 
 新增场景：复制一个现有场景，使用 `ctx.uniq()` 生成唯一主题，用 `ctx.mark()` 取得模拟服务器游标后只检查新产生的请求，需要临时改动的设置用 `ctx.defer()` 恢复。
