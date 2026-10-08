@@ -225,6 +225,21 @@ describe('Admin → 别名', () => {
     fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: '删除' }));
     await waitFor(() => expect(useToastStore.getState().toasts[0]?.message).toContain('此别名已用于发送邮件'));
   });
+  it('O2: a narrow table scrolls sideways instead of breaking the alias address per character', async () => {
+    const long = { ...alias, email: 'very-long-team-alias-address@subdomain.az.test' };
+    api.adminListAliases.mockResolvedValue([long]);
+    mountAdmin('/admin/aliases');
+    const cell = await screen.findByTitle(long.email);
+    expect(cell).toHaveTextContent(long.email);
+    // May wrap only at the "@" (<wbr>); never `break-all` (one character per line in a narrow column).
+    expect(cell.querySelector('wbr')).not.toBeNull();
+    expect(cell.className).not.toMatch(/break-all/);
+    expect(cell.className).toMatch(/word-break:keep-all/);
+    const table = cell.closest('table')!;
+    expect(table.className).toMatch(/min-w-\[640px\]/);
+    expect(table.parentElement).toHaveClass('azm-table-wrap'); // overflow-x: auto
+    expect(table.querySelector('.break-all')).toBeNull();
+  });
 });
 
 describe('Admin → 域名', () => {
@@ -385,4 +400,28 @@ describe('Admin → 统计', () => {
     expect(await screen.findByText('1,758')).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
+  it('O3 / spec F4: shows "待处理 N（其中周期任务 M）" and the poll-gap warning with its detail and time', async () => {
+    api.adminGetStats.mockResolvedValue({
+      ...stats,
+      quota_blocked: false,
+      queue: { pending: 5, dead: 0, periodic: 3 },
+      poll_gap: { detected_at: Date.UTC(2026, 9, 7, 4, 5, 6), detail: '发现 2 封 Webhook 未送达的邮件' },
+    });
+    mountAdmin('/admin/stats');
+    expect(await screen.findByTestId('queue-pending')).toHaveTextContent('5（其中周期任务 3）');
+    const banner = screen.getByTestId('poll-gap');
+    expect(banner).toHaveAttribute('role', 'alert');
+    expect(banner).toHaveTextContent('检测到收件轮询存在缺口');
+    expect(banner).toHaveTextContent('发现 2 封 Webhook 未送达的邮件');
+    expect(banner).toHaveTextContent('2026-10-07 12:05:06');
+  });
+
+  it('O3: older backends without queue.periodic / poll_gap render as before', async () => {
+    api.adminGetStats.mockResolvedValue({ ...stats, quota_blocked: false, poll_gap: null });
+    mountAdmin('/admin/stats');
+    expect(await screen.findByTestId('queue-pending')).toHaveTextContent(/^2$/);
+    expect(screen.queryByTestId('poll-gap')).not.toBeInTheDocument();
+    expect(screen.queryByText(/周期任务/)).not.toBeInTheDocument();
+  });
 });
+

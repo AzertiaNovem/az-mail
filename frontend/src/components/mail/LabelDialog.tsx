@@ -13,9 +13,10 @@ import type { Label } from '@/api/types';
 import { Button, cx, Dialog, Icon, TextField } from '@/components/common';
 import { t } from '@/i18n/zh';
 import { DEFAULT_LABEL_COLOR, LABEL_COLORS, readableTextColor } from '@/lib/color';
+import { LABEL_NAME_INPUT_MAX, LABEL_NAME_MAX, labelNameLength } from '@/lib/labelName';
 import { toast } from '@/stores/toast';
 
-export const LABEL_NAME_MAX = 225;
+export { LABEL_NAME_MAX };
 
 export type LabelDialogRequest =
   | { mode: 'create'; initialName?: string; onSaved?: (label: Label) => void }
@@ -87,7 +88,7 @@ function LabelForm({ request, onDone }: { request: LabelDialogRequest; onDone: (
       setError(t('mail.labels.nameRequired'));
       return;
     }
-    if (trimmed.length > LABEL_NAME_MAX) {
+    if (labelNameLength(trimmed) > LABEL_NAME_MAX) {
       setError(t('mail.labels.nameTooLong', { max: LABEL_NAME_MAX }));
       return;
     }
@@ -102,7 +103,13 @@ function LabelForm({ request, onDone }: { request: LabelDialogRequest; onDone: (
       request.onSaved?.(saved);
       onDone();
     } catch (err) {
-      setError(isApiError(err, 'label_exists') ? t('errors.label_exists') : errorMessage(err));
+      setError(
+        isApiError(err, 'label_exists')
+          ? t('errors.label_exists')
+          : isApiError(err, 'invalid_field') && err.details.field === 'name'
+            ? t('mail.labels.nameTooLong', { max: LABEL_NAME_MAX })
+            : errorMessage(err),
+      );
     } finally {
       setBusy(false);
     }
@@ -114,7 +121,7 @@ function LabelForm({ request, onDone }: { request: LabelDialogRequest; onDone: (
         label={t('mail.labels.name')}
         placeholder={t('mail.labels.namePlaceholder')}
         value={name}
-        maxLength={LABEL_NAME_MAX + 20}
+        maxLength={LABEL_NAME_INPUT_MAX}
         onChange={(e) => {
           setName(e.target.value);
           if (error) setError(null);

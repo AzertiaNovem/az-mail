@@ -1,6 +1,7 @@
 /**
- * Shared building blocks of the admin pages [WP-F]: status chips, query state (loading /
- * error / empty), a copy-to-clipboard button and the admin's display timezone.
+ * Shared building blocks of the admin pages [WP-F]: status chips, email addresses in table
+ * cells, query state (loading / error / empty), a copy-to-clipboard button and the admin's
+ * display timezone.
  */
 import type { UseQueryResult } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
@@ -36,6 +37,28 @@ const STATUS_TONES: Record<OutboundStatus, ChipTone> = {
   suppressed: 'error',
   canceled: 'neutral',
 };
+
+/**
+ * An email address in a table cell: may wrap only before the "@" (`<wbr>`; the local part and
+ * the domain never break inside). Narrow screens scroll the table sideways (`.azm-table-wrap`)
+ * instead of breaking the address one character per line.
+ */
+export function EmailAddress({ email, className }: { email: string; className?: string }) {
+  const at = email.lastIndexOf('@');
+  return (
+    <span className={cx('[overflow-wrap:normal] [word-break:keep-all]', className)} title={email}>
+      {at > 0 ? (
+        <>
+          {email.slice(0, at)}
+          <wbr />
+          {email.slice(at)}
+        </>
+      ) : (
+        email
+      )}
+    </span>
+  );
+}
 
 export function OutboundStatusChip({ status }: { status: OutboundStatus }) {
   return <Chip tone={STATUS_TONES[status] ?? 'neutral'}>{statusName(status) ?? status}</Chip>;

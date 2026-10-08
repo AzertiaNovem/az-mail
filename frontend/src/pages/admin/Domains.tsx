@@ -94,7 +94,7 @@ export function AdminDomains() {
               <tbody>
                 {list.map((d) => (
                   <tr key={d.id}>
-                    <td className="font-medium break-all">{d.name}</td>
+                    <td className="font-medium whitespace-nowrap">{d.name}</td>
                     <td>
                       <Chip tone={d.receiving_enabled ? 'success' : 'neutral'}>
                         {d.receiving_enabled ? t('admin.common.yes') : t('admin.common.no')}

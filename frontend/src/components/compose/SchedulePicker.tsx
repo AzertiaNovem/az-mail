@@ -1,7 +1,8 @@
 /**
  * "定时发送" dialog [WP-F]: Gmail's presets (明天上午 8:00 / 明天下午 1:00 / 下周一上午 8:00)
  * and a custom date + time picker, in the user's display timezone (shown), validated to
- * 1 minute – 30 days ahead.
+ * 1 minute – 30 days ahead. Also used to reschedule a scheduled message (`title`,
+ * `confirmLabel`, `currentAt`: the custom picker starts at the current time, which is shown).
  */
 import { useState, type FormEvent } from 'react';
 import { Button, Dialog, FieldMessage, Icon, TextField } from '@/components/common';
@@ -35,6 +36,12 @@ export interface SchedulePickerProps {
   onOpenChange: (open: boolean) => void;
   timeZone: string;
   onSchedule: (at: number) => void;
+  /** Dialog title (default 定时发送). */
+  title?: string;
+  /** Custom picker's confirm button (default 定时发送). */
+  confirmLabel?: string;
+  /** The time already scheduled (reschedule): shown, and the custom picker starts from it. */
+  currentAt?: number | null;
   /** Clock (tests). */
   now?: () => number;
 }
@@ -44,12 +51,12 @@ export function SchedulePicker(props: SchedulePickerProps) {
   return props.open ? <SchedulePickerBody {...props} /> : null;
 }
 
-function SchedulePickerBody({ onOpenChange, timeZone, onSchedule, now = Date.now }: SchedulePickerProps) {
+function SchedulePickerBody({ onOpenChange, timeZone, onSchedule, title, confirmLabel, currentAt = null, now = Date.now }: SchedulePickerProps) {
   const tz = safeTimeZone(timeZone);
   const [opened] = useState(now);
   const presets = schedulePresets(opened, tz);
   const [custom, setCustom] = useState(false);
-  const initial = toLocalInputs(presets[0]?.at ?? opened + 3_600_000, tz);
+  const initial = toLocalInputs(currentAt ?? presets[0]?.at ?? opened + 3_600_000, tz);
   const [date, setDate] = useState(initial.date);
   const [time, setTime] = useState(initial.time);
   const [error, setError] = useState<ScheduleError | null>(null);
@@ -78,16 +85,21 @@ function SchedulePickerBody({ onOpenChange, timeZone, onSchedule, now = Date.now
   };
 
   const tzLine = (
-    <p className="text-xs text-on-surface-variant">
-      {t('compose.schedule.timezone', { tz, offset: formatGmtOffset(opened, tz) })}
-    </p>
+    <>
+      {currentAt !== null && (
+        <p className="text-xs text-on-surface-variant">{t('compose.schedule.current', { time: formatScheduleTime(currentAt, tz, opened) })}</p>
+      )}
+      <p className="text-xs text-on-surface-variant">
+        {t('compose.schedule.timezone', { tz, offset: formatGmtOffset(opened, tz) })}
+      </p>
+    </>
   );
 
   return (
     <Dialog
       open
       onOpenChange={onOpenChange}
-      title={custom ? t('compose.schedule.custom') : t('compose.schedule.title')}
+      title={custom ? t('compose.schedule.custom') : (title ?? t('compose.schedule.title'))}
       size="sm"
       footer={
         custom ? (
@@ -95,7 +107,7 @@ function SchedulePickerBody({ onOpenChange, timeZone, onSchedule, now = Date.now
             <Button variant="text" onClick={() => setCustom(false)}>
               {t('compose.schedule.back')}
             </Button>
-            <Button onClick={() => submitCustom()}>{t('compose.schedule.confirm')}</Button>
+            <Button onClick={() => submitCustom()}>{confirmLabel ?? t('compose.schedule.confirm')}</Button>
           </>
         ) : (
           <Button variant="text" onClick={() => onOpenChange(false)}>

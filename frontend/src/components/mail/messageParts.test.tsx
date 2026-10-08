@@ -4,13 +4,14 @@ import { TooltipProvider } from '@/components/common';
 import { authSummary, formatAddress, recipientSummary, replyAllCount } from './addressing';
 import { listedAttachments } from './AttachmentList';
 import { draftOnlyTarget, replyTarget } from './compose';
-import { deliveryLabel, eventDetail, eventName, statusTone } from './DeliveryStatus';
+import { ApiError } from '@/api/client';
+import { deliveryLabel, eventDetail, eventName, rescheduleErrorMessage, statusTone } from './DeliveryStatus';
 import { fileIconFor, isImageType } from './fileIcon';
 import { labelState } from './LabelMenu';
 import { pagerLabel } from './Pager';
 import { linkify, PlainTextBody, splitQuoted } from './PlainTextBody';
 import { detail, message } from './testFixtures';
-import { initialExpanded, inViewScope, olderGroup, partitionMessages } from './ThreadView';
+import { freshMessages, initialExpanded, inViewScope, olderGroup, partitionMessages } from './ThreadView';
 
 const mine = new Set(['alice@team.test', 'support@team.test']);
 
@@ -87,6 +88,18 @@ describe('thread view helpers', () => {
     expect(olderGroup(msgs.slice(0, 4), expanded)).toBeNull(); // short threads are never folded
   });
 
+  it('F2: a draft that is sent keeps its id but counts as fresh mail (so it gets expanded)', () => {
+    const seen = new Set<number>();
+    expect(freshMessages([m({ id: 10 }), m({ id: 11, is_draft: true })], seen).map((x) => x.id)).toEqual([10]);
+    // Same detail again: nothing new.
+    expect(freshMessages([m({ id: 10 }), m({ id: 11, is_draft: true })], seen)).toEqual([]);
+    // The reply draft 11 was sent (same row, is_draft=0): fresh now.
+    expect(freshMessages([m({ id: 10 }), m({ id: 11 })], seen).map((x) => x.id)).toEqual([11]);
+    // Undo send (back to a draft) and send again: fresh again.
+    freshMessages([m({ id: 10 }), m({ id: 11, is_draft: true })], seen);
+    expect(freshMessages([m({ id: 10 }), m({ id: 11 })], seen).map((x) => x.id)).toEqual([11]);
+  });
+
   it('finds reply and draft-only targets', () => {
     const d = detail(1, [m({ id: 1 }), m({ id: 2 }), m({ id: 3, is_draft: true }), m({ id: 4, trashed: true })]);
     expect(replyTarget(d.messages)!.id).toBe(2);
@@ -136,6 +149,12 @@ describe('addressing and header helpers', () => {
     const msg = { html: '<img src="https://api/api/files/1?d=i&sig=x"><img src="cid:c2">', attachments: [att(1, true, 'c1'), att(2, true, 'c2'), att(3, true, 'c3'), att(4, false, null)] };
     expect(listedAttachments(msg).map((a) => a.id)).toEqual([3, 4]);
     expect(listedAttachments({ ...msg, html: null }).map((a) => a.id)).toEqual([1, 2, 3, 4]);
+  });
+
+  it('spec F5: maps reschedule failures to a message', () => {
+    expect(rescheduleErrorMessage(new ApiError(409, 'already_sent', 'x'))).toBe('邮件已发出，无法更改发送时间');
+    expect(rescheduleErrorMessage(new ApiError(409, 'invalid_state', '正在提交定时发送，请稍后重试'))).toBe('正在提交定时发送，请稍后重试');
+    expect(rescheduleErrorMessage(new ApiError(422, 'invalid_schedule', '定时发送时间需在 1 分钟后至 30 天内'))).toBe('定时发送时间需在 1 分钟后至 30 天内');
   });
 
   it('labels delivery statuses and events', () => {

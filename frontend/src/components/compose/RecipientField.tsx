@@ -24,6 +24,7 @@ import { queryKeys, staleTimes } from '@/api/queryKeys';
 import type { Address, Contact, ContactKind } from '@/api/types';
 import { Avatar, cx, Icon } from '@/components/common';
 import { t } from '@/i18n/zh';
+import { isImeKeyEvent } from '@/lib/keyboard';
 import {
   addressLabel,
   containsEmail,
@@ -174,6 +175,8 @@ export const RecipientField = forwardRef<RecipientFieldHandle, RecipientFieldPro
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    // The Enter / Tab / Backspace of an IME composition (Pinyin…) belongs to the input method.
+    if (isImeKeyEvent(e)) return;
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
       if (text.trim()) commitText(text); // then let the window send
       return;

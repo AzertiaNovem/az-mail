@@ -1,8 +1,9 @@
 /**
  * Admin → 统计 [WP-F]: cards for users, messages, attachment storage (backend / delivery /
- * blob count / bytes), the job queue (pending / dead), the last 24 h (sent / received /
- * failed) and the last webhook / poll; a warning banner while Resend's quota is exhausted;
- * and "立即同步收件" (POST /api/admin/sync → enqueues poll.receiving). Refreshes every 30 s.
+ * blob count / bytes), the job queue (pending, of which periodic / dead), the last 24 h (sent /
+ * received / failed) and the last webhook / poll; warning banners while Resend's quota is
+ * exhausted and when the inbound poller detected a gap (`poll_gap`, DESIGN B7); and "立即同步收件"
+ * (POST /api/admin/sync → enqueues poll.receiving). Refreshes every 30 s.
  *
  * Contract: `export function AdminStats()`, no props, rendered inside AdminLayout's `<Outlet/>`.
  */
@@ -54,6 +55,16 @@ function StatsGrid({ s, tz }: { s: AdminStatsData; tz: string }) {
           <span>{t('admin.stats.quotaBlocked')}</span>
         </div>
       )}
+      {s.poll_gap && (
+        <div className="azm-banner tone-warning" role="alert" data-testid="poll-gap">
+          <Icon name="sync_problem" size={20} />
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <span className="font-medium">{t('admin.stats.pollGapTitle')}</span>
+            <span>{t('admin.stats.pollGapHint', { time: formatDateTime(s.poll_gap.detected_at, tz, { seconds: true }) })}</span>
+            {s.poll_gap.detail && <span className="break-words text-xs opacity-80">{s.poll_gap.detail}</span>}
+          </div>
+        </div>
+      )}
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         <StatCard icon="group" title={t('admin.stats.users')}>
           <Big>{formatCount(s.users)}</Big>
@@ -71,7 +82,18 @@ function StatsGrid({ s, tz }: { s: AdminStatsData; tz: string }) {
         </StatCard>
         <StatCard icon="pending_actions" title={t('admin.stats.queue')} tone={s.queue.dead > 0 ? 'error' : undefined}>
           <div className="flex gap-8">
-            <Pair label={t('admin.stats.pending')} value={formatCount(s.queue.pending)} />
+            <Pair
+              label={t('admin.stats.pending')}
+              value={
+                <span data-testid="queue-pending">
+                  {formatCount(s.queue.pending)}
+                  {/* "待处理 N（其中周期任务 M）": the recurring jobs are always queued (older backends omit it). */}
+                  {typeof s.queue.periodic === 'number' && (
+                    <span className="text-sm text-on-surface-variant">{t('admin.stats.pendingPeriodic', { count: formatCount(s.queue.periodic) })}</span>
+                  )}
+                </span>
+              }
+            />
             <Pair label={t('admin.stats.dead')} value={formatCount(s.queue.dead)} tone={s.queue.dead > 0 ? 'error' : undefined} />
           </div>
         </StatCard>

@@ -5,6 +5,7 @@ import {
   dispatchShortcut,
   installShortcutListener,
   isEditableTarget,
+  isImeKeyEvent,
   normalizeKey,
   registerShortcuts,
   SHORTCUT_HELP,
@@ -196,3 +197,36 @@ describe('dispatch', () => {
     expect(SHORTCUT_HELP.find((s) => s.label === 'mail.shortcuts.items.open')?.join).toBe('or');
   });
 });
+
+describe('review fixes', () => {
+  it('F7: a listener on a same-origin iframe window handles keys typed while focus is in the frame', () => {
+    const frame = document.createElement('iframe');
+    document.body.appendChild(frame);
+    const frameWin = frame.contentWindow! as Window & typeof globalThis;
+    const doc = frame.contentDocument!;
+    doc.body.innerHTML = '<p id="p">正文</p><input id="i">';
+    const reply = vi.fn();
+    const off = registerShortcuts(() => ({ reply }));
+    const uninstall = installShortcutListener(frameWin);
+    const send = (target: EventTarget, key: string) =>
+      target.dispatchEvent(new frameWin.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+    send(doc.getElementById('p')!, 'r');
+    expect(reply).toHaveBeenCalledOnce();
+    // Guards still apply to the frame's own elements (cross-realm: not `instanceof` the app's Element).
+    send(doc.getElementById('i')!, 'r');
+    expect(reply).toHaveBeenCalledOnce();
+    uninstall();
+    send(doc.getElementById('p')!, 'r');
+    expect(reply).toHaveBeenCalledOnce();
+    off();
+  });
+
+  it('F8: recognizes IME composition keys from DOM and React events', () => {
+    expect(isImeKeyEvent({ isComposing: true })).toBe(true);
+    expect(isImeKeyEvent({ keyCode: 229 })).toBe(true);
+    expect(isImeKeyEvent({ nativeEvent: { isComposing: true } })).toBe(true);
+    expect(isImeKeyEvent({ nativeEvent: { keyCode: 229 } })).toBe(true);
+    expect(isImeKeyEvent({ isComposing: false, keyCode: 13 })).toBe(false);
+  });
+});
+

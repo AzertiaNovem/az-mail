@@ -11,7 +11,7 @@
  */
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEditorState } from '@tiptap/react';
-import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type DragEvent, type KeyboardEvent, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type DragEvent, type KeyboardEvent } from 'react';
 import { useNavigate } from 'react-router';
 import { errorMessage, isApiError } from '@/api/client';
 import { deleteDraft, getDraft, getMessage, getThread } from '@/api/endpoints';
@@ -25,16 +25,18 @@ import type {
   UnknownLocalRecipientDetails,
   VersionConflictDetails,
 } from '@/api/types';
-import { Button, ConfirmDialog, cx, Dialog, DropdownMenu, IconButton, Spinner } from '@/components/common';
+import { Button, ConfirmDialog, Dialog, DropdownMenu, IconButton } from '@/components/common';
 import { resolveApiUrl } from '@/config';
 import { t } from '@/i18n/zh';
 import { attachmentIdsForSave, isBlankHtml } from '@/lib/emailHtml';
+import { isImeKeyEvent } from '@/lib/keyboard';
 import { safeTimeZone } from '@/lib/quote';
 import { isValidEmail, normalizeEmail } from '@/lib/recipients';
 import { checkUploadSizes, isInlineImage, sizeRejectionMessage, UploadQueue, type UploadItem } from '@/lib/upload';
-import { useComposeStore, type ComposeWin } from '@/stores/compose';
+import { useComposeStore, type ComposeInit, type ComposeWin } from '@/stores/compose';
 import { toast } from '@/stores/toast';
 import { AttachmentBar } from './AttachmentBar';
+import { LoadingWindow, TitleBar, WindowShell, windowClass } from './ComposeShell';
 import { dragHasFiles, EditorSurface, filesFromTransfer, useMailEditor, type Editor } from './Editor';
 import { EditorToolbar } from './EditorToolbar';
 import { hasSignature } from './extensions/Signature';
@@ -43,7 +45,7 @@ import { LinkDialog } from './LinkDialog';
 import { QuotedToggle } from './QuotedToggle';
 import { RecipientField, type RecipientFieldHandle } from './RecipientField';
 import { SchedulePicker } from './SchedulePicker';
-import { findParent, seedFromDraft, seedFromInit, type ComposeSeed } from './seed';
+import { findParent, seedFromDraft, seedFromInit, withUnsaved, type ComposeSeed } from './seed';
 import { SendButton } from './SendButton';
 import { DraftConflictError, useAutosave, type AutosaveApi } from './useAutosave';
 import { fieldLabel, preSendCheck, recipientFieldOf, useDraftSend } from './useDraftSend';
@@ -73,80 +75,24 @@ export interface ComposeTestOptions {
   debounceMs?: number;
 }
 
-// ───────────── window shell ─────────────
-
-interface TitleBarProps {
-  win: ComposeWin;
-  titleId: string;
-  title: string;
-  onClose: () => void;
-  busy?: boolean;
-}
-
-function TitleBar({ win, titleId, title, onClose, busy }: TitleBarProps) {
-  const toggleMinimize = useComposeStore((s) => s.toggleMinimize);
-  const toggleMaximize = useComposeStore((s) => s.toggleMaximize);
-  return (
-    <header className="cw-titlebar">
-      <h2 id={titleId} className="cw-title">
-        <button
-          type="button"
-          className="cw-title-button"
-          aria-expanded={!win.minimized}
-          onClick={() => toggleMinimize(win.key)}
-        >
-          {busy ? t('compose.closing') : title}
-        </button>
-      </h2>
-      <div className="cw-title-actions">
-        <IconButton
-          icon={win.minimized ? 'keyboard_arrow_up' : 'remove'}
-          label={win.minimized ? t('compose.restore') : t('compose.minimize')}
-          size="sm"
-          tooltipSide="top"
-          onClick={() => toggleMinimize(win.key)}
-        />
-        <IconButton
-          icon={win.maximized ? 'close_fullscreen' : 'open_in_full'}
-          label={win.maximized ? t('compose.exitMaximize') : t('compose.maximize')}
-          size="sm"
-          iconSize={16}
-          tooltipSide="top"
-          onClick={() => toggleMaximize(win.key)}
-        />
-        <IconButton icon="close" label={t('compose.close')} size="sm" tooltipSide="top" onClick={onClose} disabled={busy} />
-      </div>
-    </header>
-  );
-}
-
-function windowClass(win: ComposeWin, focused: boolean) {
-  return cx('cw', win.minimized && 'is-min', win.maximized && !win.minimized && 'is-max', focused && 'is-focused');
-}
-
-/** Loading / error state with a working title bar. */
-function WindowShell({ win, children }: { win: ComposeWin; children: ReactNode }) {
-  const titleId = useId();
-  const focused = useComposeStore((s) => s.focusedKey === win.key);
-  const close = useComposeStore((s) => s.close);
-  return (
-    <section className={windowClass(win, focused)} role="dialog" aria-labelledby={titleId} data-testid="compose-window">
-      <TitleBar win={win} titleId={titleId} title={win.title || t('compose.newMessage')} onClose={() => close(win.key)} />
-      <div className="cw-body" hidden={win.minimized}>
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center text-sm text-on-surface-variant">
-          {children}
-        </div>
-      </div>
-    </section>
-  );
-}
-
 // ───────────── loading ─────────────
 
 type LoadState = { status: 'loading' } | { status: 'error'; message: string; retry?: () => void } | { status: 'ready'; seed: ComposeSeed };
 
+/**
+ * What the form starts from. A window whose draft already exists always (re)loads that draft,
+ * whatever it was opened as: its form may remount while the window stays open (the app shell
+ * unmounts on /login after an expired session), and seeding a fresh message / reply again
+ * would show a blank body and create a second draft.
+ */
+export function effectiveInit(win: Pick<ComposeWin, 'init' | 'draftId'>): ComposeInit {
+  return win.draftId !== null && win.init.kind !== 'draft' ? { kind: 'draft', draftId: win.draftId } : win.init;
+}
+
 function useComposeSeed(win: ComposeWin, me: Me | undefined): LoadState {
-  const init = win.init;
+  // The seed is computed once: later cache updates must not reset a form being edited.
+  const [frozen, setFrozen] = useState<ComposeSeed | null>(null);
+  const init = effectiveInit(win);
   const isReply = init.kind === 'reply' || init.kind === 'reply_all' || init.kind === 'forward';
   const parentId = isReply ? init.parentMessageId : 0;
   const threadId = isReply ? init.threadId : 0;
@@ -154,26 +100,24 @@ function useComposeSeed(win: ComposeWin, me: Me | undefined): LoadState {
   const draftQ = useQuery({
     queryKey: queryKeys.draft(init.kind === 'draft' ? init.draftId : 0),
     queryFn: ({ signal }) => getDraft(init.kind === 'draft' ? init.draftId : 0, signal),
-    enabled: init.kind === 'draft',
+    enabled: init.kind === 'draft' && !frozen,
     staleTime: staleTimes.draft,
     retry: false,
   });
   const threadQ = useQuery({
     queryKey: queryKeys.thread(threadId),
     queryFn: ({ signal }) => getThread(threadId, signal),
-    enabled: isReply,
+    enabled: isReply && !frozen,
     staleTime: staleTimes.thread,
   });
   const fromThread = isReply ? findParent(threadQ.data?.messages, parentId) : null;
   const msgQ = useQuery({
     queryKey: ['compose', 'parent', parentId] as const,
     queryFn: ({ signal }) => getMessage(parentId, signal),
-    enabled: isReply && !fromThread && (threadQ.isError || threadQ.isSuccess),
+    enabled: isReply && !frozen && !fromThread && (threadQ.isError || threadQ.isSuccess),
     staleTime: staleTimes.thread,
   });
 
-  // The seed is computed once: later cache updates must not reset a form being edited.
-  const [frozen, setFrozen] = useState<ComposeSeed | null>(null);
   if (frozen) return { status: 'ready', seed: frozen };
   if (!me) return { status: 'loading' };
 
@@ -203,6 +147,7 @@ function useComposeSeed(win: ComposeWin, me: Me | undefined): LoadState {
       };
     else return { status: 'loading' };
   }
+  seed = withUnsaved(seed, win.unsaved);
   setFrozen(seed); // render-phase update: re-renders right away with the frozen seed
   return { status: 'ready', seed };
 }
@@ -224,14 +169,7 @@ export const ComposeWindow = memo(function ComposeWindow({ win, testOptions }: C
   if (me.isError && !me.data) {
     return <WindowShell win={win}>{errorMessage(me.error)}</WindowShell>;
   }
-  if (!me.data || load.status === 'loading') {
-    return (
-      <WindowShell win={win}>
-        <Spinner />
-        <span>{t('compose.loading')}</span>
-      </WindowShell>
-    );
-  }
+  if (!me.data || load.status === 'loading') return <LoadingWindow win={win} />;
   if (load.status === 'error') {
     return (
       <WindowShell win={win}>
@@ -268,6 +206,9 @@ interface AlertState {
 type UploadSource = 'attach' | 'photo' | 'paste' | 'drop';
 
 const validOnly = (list: readonly Address[]) => list.filter((a) => isValidEmail(a.email));
+
+/** Same file (a server-side copy of an attachment has a new id). */
+const sameFile = (a: Attachment, b: Attachment) => a.filename === b.filename && a.size === b.size && a.content_type === b.content_type;
 
 interface ComposeFormProps {
   win: ComposeWin;
@@ -321,6 +262,13 @@ function ComposeForm({ win, me, seed, onReload, testOptions }: ComposeFormProps)
   const [conflictBusy, setConflictBusy] = useState(false);
   const [closeFailed, setCloseFailed] = useState<string | null>(null);
 
+  // A forward shows the parent's attachments until the first save copies them onto the draft;
+  // the server's copies are then adopted into `fields.attachments` (see adoptServerAttachments).
+  const [inherited, setInherited] = useState<Attachment[]>(seed.inheritedAttachments);
+  const inheritedRef = useRef(inherited);
+  /** Inherited attachments removed before the copies existed (their copies are dropped on adoption). */
+  const removedInherited = useRef<Attachment[]>([]);
+
   const [queue] = useState(() => new UploadQueue());
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   useEffect(() => {
@@ -357,6 +305,37 @@ function ComposeForm({ win, me, seed, onReload, testOptions }: ComposeFormProps)
     }),
     [seed.mode, seed.parentMessageId, seed.includeParentAttachments],
   );
+  // POST /api/drafts copied the forwarded message's attachments: show them and keep them on
+  // every later save and on the send (an unlisted regular attachment is deleted by the server).
+  // fieldsRef is updated synchronously: a send right after the first save collects them too.
+  const adoptServerAttachments = (draft: Draft) => {
+    const known = new Set(fieldsRef.current.attachments.map((a) => a.id));
+    const removed = [...removedInherited.current];
+    const added: Attachment[] = [];
+    let dropped = false;
+    for (const a of draft.attachments) {
+      // Copied inline quote images are kept by the server through the quote's references.
+      if (a.inline || known.has(a.id)) continue;
+      const i = removed.findIndex((r) => sameFile(r, a));
+      if (i !== -1) {
+        removed.splice(i, 1);
+        dropped = true; // removed by the user before the copy existed: the next save drops it
+        continue;
+      }
+      added.push(a);
+    }
+    removedInherited.current = [];
+    if (inheritedRef.current.length) {
+      inheritedRef.current = [];
+      setInherited([]);
+    }
+    if (added.length) {
+      fieldsRef.current = { ...fieldsRef.current, attachments: [...fieldsRef.current.attachments, ...added] };
+      setFieldsState(fieldsRef.current);
+    }
+    if (dropped) saver.markDirty();
+  };
+
   const saver = useAutosave({
     winKey: win.key,
     draftId: seed.draftId,
@@ -364,9 +343,47 @@ function ComposeForm({ win, me, seed, onReload, testOptions }: ComposeFormProps)
     collect,
     createFields,
     onConflict: (current) => setConflict({ current }),
+    onSaved: (draft, created) => {
+      if (created) adoptServerAttachments(draft);
+    },
     api: testOptions?.autosaveApi,
     debounceMs: testOptions?.debounceMs,
   });
+
+  // Restored unsaved edits (the form remounted after a re-login) are saved right away.
+  const seedDirty = !!seed.dirty;
+  useEffect(() => {
+    if (seedDirty) saver.markDirty();
+  }, [saver, seedDirty]);
+
+  // The window outlives this form when the app shell unmounts (expired session → /login):
+  // stash the edits the server does not have yet, so the remounted form starts from them.
+  useEffect(() => {
+    const store = useComposeStore.getState();
+    if (store.windows.find((w) => w.key === win.key)?.unsaved) store.patch(win.key, { unsaved: undefined });
+    const owned = editorOwned.current; // one Set for the form's lifetime (mutated in place)
+    return () => {
+      const st = useComposeStore.getState();
+      if (!st.windows.some((w) => w.key === win.key)) return; // closed / sent / discarded
+      if (!saver.dirty && !saver.saving && !saver.inConflict) return;
+      const input = collect();
+      const f = fieldsRef.current;
+      st.patch(win.key, {
+        unsaved: {
+          fromAddressId: f.fromAddressId,
+          to: [...f.to],
+          cc: [...f.cc],
+          bcc: [...f.bcc],
+          subject: f.subject,
+          html: input.html ?? lastHtmlRef.current,
+          quotedHtml: f.quotedHtml,
+          attachments: [...f.attachments],
+          editorInlineIds: [...owned],
+        },
+      });
+    };
+    // Mount / unmount only (all stable): the stash is read from refs at unmount time.
+  }, [saver, win.key, collect]);
 
   const update = useCallback(
     (patch: Partial<Fields>) => {
@@ -412,7 +429,7 @@ function ComposeForm({ win, me, seed, onReload, testOptions }: ComposeFormProps)
     const wantInline = source !== 'attach';
     const images = new Set(wantInline ? files.filter(isInlineImage) : []);
     const existing =
-      fieldsRef.current.attachments.reduce((n, a) => n + a.size, 0) + queue.pendingBytes();
+      [...fieldsRef.current.attachments, ...inheritedRef.current].reduce((n, a) => n + a.size, 0) + queue.pendingBytes();
     const { accepted, rejected } = checkUploadSizes(files, existing);
     if (rejected.length) setAlert({ title: t('compose.attachments.rejectedTitle'), lines: rejected.map(sizeRejectionMessage) });
     const inline = accepted.filter((f) => images.has(f));
@@ -438,7 +455,17 @@ function ComposeForm({ win, me, seed, onReload, testOptions }: ComposeFormProps)
     }
   };
 
-  const removeAttachment = (id: number) => update({ attachments: fieldsRef.current.attachments.filter((a) => a.id !== id) });
+  const removeAttachment = (id: number) => {
+    const fromParent = inheritedRef.current.find((a) => a.id === id);
+    if (fromParent) {
+      inheritedRef.current = inheritedRef.current.filter((a) => a.id !== id);
+      setInherited(inheritedRef.current);
+      removedInherited.current = [...removedInherited.current, fromParent];
+      saver.markDirty();
+      return;
+    }
+    update({ attachments: fieldsRef.current.attachments.filter((a) => a.id !== id) });
+  };
 
   // ── close / discard ──
   const finishClose = () => {
@@ -613,6 +640,8 @@ function ComposeForm({ win, me, seed, onReload, testOptions }: ComposeFormProps)
   const onKeyDown = (e: KeyboardEvent) => {
     // Events from portaled dialogs bubble through React; only handle our own DOM.
     if (!rootRef.current?.contains(e.target as Node)) return;
+    // Esc cancels an IME candidate list and Enter confirms it: neither closes nor sends.
+    if (isImeKeyEvent(e)) return;
     const mod = e.ctrlKey || e.metaKey;
     if (mod && e.key === 'Enter') {
       e.preventDefault();
@@ -649,7 +678,7 @@ function ComposeForm({ win, me, seed, onReload, testOptions }: ComposeFormProps)
           : win.saveState === 'conflict'
             ? t('compose.saveState.conflict')
             : '';
-  const regularAttachments = fields.attachments.filter((a) => !a.inline);
+  const regularAttachments = [...inherited, ...fields.attachments.filter((a) => !a.inline)];
 
   return (
     // A non-modal dialog handles its own shortcuts (Esc, Ctrl+Enter), focus, blur-save and drops.
@@ -780,7 +809,13 @@ function ComposeForm({ win, me, seed, onReload, testOptions }: ComposeFormProps)
             <IconButton icon="attach_file" label={t('compose.attach')} size="sm" tooltipSide="top" disabled={busy} onClick={() => attachInputRef.current?.click()} />
             <IconButton icon="link" label={t('compose.insertLink')} size="sm" tooltipSide="top" disabled={busy} onClick={() => setLinkOpen(true)} />
             <IconButton icon="photo" label={t('compose.insertPhoto')} size="sm" tooltipSide="top" disabled={busy} onClick={() => photoInputRef.current?.click()} />
-            <SignatureMenu editor={editor} signatureHtml={me.settings.signature_html} disabled={busy} onManage={() => void navigate('/settings/general')} />
+            <SignatureMenu
+              editor={editor}
+              signatureHtml={me.settings.signature_html}
+              filesOrigins={filesOrigins}
+              disabled={busy}
+              onManage={() => void navigate('/settings/general')}
+            />
           </div>
           <span className="cw-save-state" aria-live="polite">
             {saveText}
@@ -912,14 +947,21 @@ function ComposeForm({ win, me, seed, onReload, testOptions }: ComposeFormProps)
 
 // ───────────── signature menu ─────────────
 
+/**
+ * 签名 ▸ 不使用签名 / 插入签名. The client owns the signature (the server sends the body as
+ * the editor shows it): new messages, replies and forwards start with it when enabled, and this
+ * menu removes it or (re-)inserts exactly one copy above the quote.
+ */
 function SignatureMenu({
   editor,
   signatureHtml,
+  filesOrigins,
   disabled,
   onManage,
 }: {
   editor: Editor | null;
   signatureHtml: string;
+  filesOrigins: string[];
   disabled?: boolean;
   onManage: () => void;
 }) {
@@ -942,7 +984,7 @@ function SignatureMenu({
           label: blank ? t('compose.signatureMenu.empty') : t('compose.signatureMenu.insert'),
           icon: present ? 'check' : undefined,
           disabled: blank,
-          onSelect: () => editor?.chain().focus().setSignature(signatureHtml).run(),
+          onSelect: () => editor?.chain().focus().setSignature(signatureHtml, filesOrigins).run(),
         },
         { key: 'sep', type: 'separator' },
         { key: 'manage', label: t('compose.signatureMenu.manage'), icon: 'settings', onSelect: onManage },

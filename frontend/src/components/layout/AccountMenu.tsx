@@ -1,15 +1,21 @@
 /**
  * Account avatar menu [WP-E] (Gmail account card): email, large avatar, greeting, 管理设置,
- * 管理后台 (admins), 退出登录 (POST /api/auth/logout, then local logout even if it fails).
+ * 管理后台 (admins), 退出登录: open compose windows save their pending edits first (the token
+ * is revoked afterwards), then POST /api/auth/logout and the local logout even if it fails —
+ * a voluntary logout, so the login page shows no "session expired" message.
  */
 import { useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import { useNavigate } from 'react-router';
 import { logout } from '@/api/endpoints';
+import { flushAllDrafts } from '@/components/compose/useAutosave';
 import { Avatar, Button, Icon, Popover } from '@/components/common';
 import { useMe } from '@/components/mail/queries';
 import { t } from '@/i18n/zh';
-import { logoutLocally } from '@/stores/auth';
+import { signOut as endSession } from '@/stores/auth';
+
+/** How long 退出登录 waits for open drafts to save. */
+const DRAFT_FLUSH_TIMEOUT_MS = 5000;
 
 export function AccountMenu() {
   const me = useMe();
@@ -23,13 +29,10 @@ export function AccountMenu() {
   const signOut = async () => {
     setBusy(true);
     try {
-      await logout();
-    } catch {
-      /* the local session ends regardless */
+      await endSession(qc, logout, () => flushAllDrafts(DRAFT_FLUSH_TIMEOUT_MS));
     } finally {
       setBusy(false);
       setOpen(false);
-      logoutLocally(qc);
     }
   };
 

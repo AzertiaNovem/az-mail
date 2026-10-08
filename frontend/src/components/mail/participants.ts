@@ -1,6 +1,8 @@
 /**
  * Thread-row sender column (Gmail style) [WP-E]: "张三, 我 3", "Alice .. Bob, 我 7",
- * "我, 草稿 2", and "草稿" alone in the drafts folder. Unread participants are bold.
+ * "我, 草稿 2", and "草稿" alone in the drafts folder. Unread participants are bold. The Sent
+ * and Scheduled folders show whom the mail went to instead: "收件人：张三, 李四" (from
+ * `to_preview`; servers without it fall back to the senders).
  */
 import type { Address, FolderId, ThreadListItem } from '@/api/types';
 import { t } from '@/i18n/zh';
@@ -15,6 +17,8 @@ export interface ParticipantPart {
 }
 
 export interface ParticipantsView {
+  /** Text before the names ("收件人：" in Sent / Scheduled), else null. */
+  prefix: string | null;
   parts: ParticipantPart[];
   /** Message count shown after the names (null when 1). */
   count: number | null;
@@ -42,9 +46,28 @@ export function participantsView(item: ThreadListItem, folder: FolderId | null):
   const draftLabel = t('mail.list.draft');
   if (draftOnly) {
     return {
+      prefix: null,
       parts: [{ text: draftLabel, bold: false, draft: true }],
       count: item.draft_count > 1 ? item.draft_count : null,
       title: draftLabel,
+    };
+  }
+  const total = item.message_count + item.draft_count;
+  const recipients = item.to_preview ?? [];
+  if ((folder === 'sent' || folder === 'scheduled') && recipients.length > 0) {
+    const many = recipients.length > 1;
+    const named = recipients.map<ParticipantPart>((p) => ({
+      text: p.is_me ? t('mail.list.me') : many ? shortName(p) : addressName(p),
+      bold: false,
+    }));
+    let parts = named.length > 3 ? [named[0]!, { text: '..', bold: false, ellipsis: true }, ...named.slice(-2)] : named;
+    if (item.draft_count > 0) parts = [...parts, { text: draftLabel, bold: false, draft: true }];
+    const prefix = t('mail.list.toPrefix');
+    return {
+      prefix,
+      parts,
+      count: total > 1 ? total : null,
+      title: prefix + recipients.map((p) => (p.is_me ? t('mail.list.me') : `${addressName(p)} <${p.email}>`)).join(', '),
     };
   }
   const people = item.participants;
@@ -59,8 +82,8 @@ export function participantsView(item: ThreadListItem, folder: FolderId | null):
   }
   if (parts.length === 0) parts = [{ text: t('mail.list.me'), bold: false }];
   if (item.draft_count > 0) parts = [...parts, { text: draftLabel, bold: false, draft: true }];
-  const total = item.message_count + item.draft_count;
   return {
+    prefix: null,
     parts,
     count: total > 1 ? total : null,
     title: people.map((p) => (p.is_me ? t('mail.list.me') : `${addressName(p)} <${p.email}>`)).join(', '),

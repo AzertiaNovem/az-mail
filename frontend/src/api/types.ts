@@ -110,6 +110,11 @@ export interface ThreadListItem {
   scheduled_at: number | null;
   /** At most 3. */
   attachments_preview: { id: number; filename: string; content_type: string }[];
+  /**
+   * Additive: To + Cc (max 10) of the thread's newest sent / scheduled message in the view, for
+   * the Sent / Scheduled rows ("收件人：张三"). Absent from older backends; [] when none.
+   */
+  to_preview?: { name: string; email: string; is_me: boolean }[];
 }
 
 /** `total` is null for search results. */
@@ -687,13 +692,22 @@ export interface AdminStats {
   users: number;
   messages: number;
   storage_bytes: number;
-  queue: { pending: number; dead: number };
+  /**
+   * `periodic` (additive): how many of the `pending` jobs are the recurring maintenance / poll
+   * jobs that are always queued. Absent from older backends.
+   */
+  queue: { pending: number; dead: number; periodic?: number };
   sent_24h: number;
   received_24h: number;
   failed_24h: number;
   last_webhook_at: number | null;
   last_poll_at: number | null;
   quota_blocked: boolean;
+  /**
+   * Additive (DESIGN B7): the inbound poller found received mail the webhook never delivered, or
+   * could not look back far enough (mail may be lost). null / absent when there is no warning.
+   */
+  poll_gap?: { detected_at: number; detail: string } | null;
   /** Addendum A. */
   storage: {
     backend: 'local' | 'r2';

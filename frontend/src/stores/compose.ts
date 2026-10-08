@@ -17,18 +17,38 @@
  *   and whenever `['me']` loads (`installComposeOwnerSync`).
  *
  * Editor content is not stored here: it lives in TipTap and is saved by the window's autosave.
- * `focusedKey`, `focusOrder`, `closeAll`, `ownerId` and `setOwner` are additive extensions of the contract.
+ * `focusedKey`, `focusOrder`, `closeAll`, `ownerId` and `setOwner` are additive extensions of the contract,
+ * as are `cc` / `bcc` / `body` of a new message (mailto: links) and `ComposeWin.unsaved`.
+ *
+ * A window's form can unmount while the window stays open: when the session expires the app
+ * shell unmounts on /login and remounts after the same user logs back in. The remounted form
+ * then loads the window's saved draft (`draftId`, not `init`), and `unsaved` carries the edits
+ * that had not reached the server yet (the form stashes them on unmount).
  */
 import { create } from 'zustand';
 import { createJSONStorage, persist, type StateStorage } from 'zustand/middleware';
-import type { Address } from '@/api/types';
+import type { Address, Attachment } from '@/api/types';
 
 export type ComposeInit =
-  | { kind: 'new'; to?: Address[]; subject?: string }
+  | { kind: 'new'; to?: Address[]; cc?: Address[]; bcc?: Address[]; subject?: string; /** Plain text (mailto: body). */ body?: string }
   | { kind: 'reply' | 'reply_all' | 'forward'; parentMessageId: number; threadId: number }
   | { kind: 'draft'; draftId: number };
 
 export type ComposeSaveState = 'idle' | 'dirty' | 'saving' | 'saved' | 'error' | 'conflict';
+
+/** Field values of a form that unmounted with edits the server has not stored yet (in memory only). */
+export interface ComposeUnsaved {
+  fromAddressId: number | undefined;
+  to: Address[];
+  cc: Address[];
+  bcc: Address[];
+  subject: string;
+  html: string;
+  quotedHtml: string | null;
+  attachments: Attachment[];
+  /** Inline attachments owned by the editor body (see attachmentIdsForSave). */
+  editorInlineIds: number[];
+}
 
 export interface ComposeWin {
   key: string;
@@ -38,6 +58,8 @@ export interface ComposeWin {
   maximized: boolean;
   saveState: ComposeSaveState;
   title: string;
+  /** Additive: unsaved edits of a form that unmounted while the window stayed open. */
+  unsaved?: ComposeUnsaved;
 }
 
 export interface ComposeStore {

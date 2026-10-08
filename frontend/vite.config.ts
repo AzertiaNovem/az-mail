@@ -26,6 +26,24 @@ export default defineConfig({
     sourcemap: true,
     // The self-hosted Material Symbols font is ~4 MB; keep it a separate file, never inlined.
     assetsInlineLimit: 4096,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          // The rich-text editor (TipTap / ProseMirror) is only used by the lazily loaded compose
+          // window and the settings signature editor: one named, cacheable chunk that the
+          // initial (inbox) load never fetches.
+          groups: [
+            {
+              name: 'editor',
+              // Only the editor packages themselves: their shared dependencies (react…) stay in
+              // the entry, otherwise the entry would import this chunk.
+              includeDependenciesRecursively: false,
+              test: /[\\/]node_modules[\\/](?:@tiptap[\\/]|prosemirror-|orderedmap[\\/]|rope-sequence[\\/]|w3c-keyname[\\/]|linkifyjs[\\/])/,
+            },
+          ],
+        },
+      },
+    },
   },
   test: {
     environment: 'jsdom',

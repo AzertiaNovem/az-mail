@@ -4,12 +4,13 @@
  */
 import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { useState, type FormEvent } from 'react';
-import { errorMessage } from '@/api/client';
+import { errorMessage, isApiError } from '@/api/client';
 import { createLabel, deleteLabel, getCounts, listLabels, updateLabel } from '@/api/endpoints';
 import { queryKeys, staleTimes } from '@/api/queryKeys';
 import type { Label, LabelInput } from '@/api/types';
 import { Button, ConfirmDialog, cx, Dialog, IconButton, Popover, Spinner, TextField } from '@/components/common';
 import { t } from '@/i18n/zh';
+import { LABEL_NAME_INPUT_MAX } from '@/lib/labelName';
 import { toast } from '@/stores/toast';
 import { LABEL_NAME_MAX, validateLabelName } from './validation';
 
@@ -69,8 +70,14 @@ function LabelDialog({ label, onClose }: LabelDialogProps) {
       toast.push({ message: label ? t('settings.labels.updated') : t('settings.labels.created', { name: saved.name }) });
       onClose();
     },
-    // label_exists / invalid_field come with a Chinese message; show it under the name field.
-    onError: (e) => setError(errorMessage(e)),
+    // label_exists comes with a Chinese message; an invalid name gets the length hint. Both go
+    // under the name field.
+    onError: (e) =>
+      setError(
+        isApiError(e, 'invalid_field') && e.details.field === 'name'
+          ? t('settings.labels.nameTooLong', { max: LABEL_NAME_MAX })
+          : errorMessage(e),
+      ),
   });
   const submit = (e?: FormEvent) => {
     e?.preventDefault();
@@ -102,7 +109,7 @@ function LabelDialog({ label, onClose }: LabelDialogProps) {
           label={t('settings.labels.name')}
           value={name}
           autoFocus
-          maxLength={LABEL_NAME_MAX + 20}
+          maxLength={LABEL_NAME_INPUT_MAX}
           error={error ?? undefined}
           onChange={(e) => {
             setName(e.target.value);

@@ -2,16 +2,18 @@
  * Delivery status of an outbound message [WP-E]: a status chip with the Chinese label
  * (待发送 … 已取消, "已定时 10月8日 09:00"), the bounce / failure detail, and a popover with the
  * event timeline (GET /api/messages/:id/events, `['message', id, 'events']`, invalidated by the
- * `outbound.status` WS event). Failed sends can be retried; scheduled ones canceled (the draft
+ * `outbound.status` WS event). Failed sends can be retried; scheduled ones rescheduled
+ * (更改发送时间: the schedule picker, POST /api/messages/:id/reschedule) or canceled (the draft
  * reopens in compose).
  */
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
-import { errorMessage } from '@/api/client';
-import { cancelSchedule, getMessageEvents, retrySend } from '@/api/endpoints';
+import { errorMessage, isApiError } from '@/api/client';
+import { cancelSchedule, getMessageEvents, reschedule, retrySend } from '@/api/endpoints';
 import { queryKeys, staleTimes } from '@/api/queryKeys';
-import type { DeliveryEvent, Message, OutboundStatus } from '@/api/types';
+import type { DeliveryEvent, Message, OutboundStatus, ThreadDetail } from '@/api/types';
 import { Button, cx, Icon, Popover, Spinner } from '@/components/common';
+import { SchedulePicker } from '@/components/compose/SchedulePicker';
 import { statusName, t, zh } from '@/i18n/zh';
 import { formatFullDate, formatScheduleTime } from '@/lib/format';
 import { toast } from '@/stores/toast';
@@ -122,9 +124,20 @@ export interface DeliveryStatusProps {
   tz: string;
 }
 
+/**
+ * Toast text for a failed reschedule: 409 `already_sent` gets its own hint; the server's
+ * message is specific for the rest (422 invalid_schedule, 409 invalid_state "正在提交定时发送…" /
+ * "该邮件不是定时邮件", 502 resend_error).
+ */
+export function rescheduleErrorMessage(e: unknown): string {
+  if (isApiError(e, 'already_sent')) return t('mail.delivery.rescheduleTooLate');
+  return errorMessage(e);
+}
+
 export function DeliveryStatus({ message, now, tz }: DeliveryStatusProps) {
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
+  const [picking, setPicking] = useState(false);
   const ob = message.outbound;
   if (!ob || message.direction !== 'out' || message.is_draft) return null;
   const tone = ob.scheduled_at !== null && SCHEDULE_PENDING.has(ob.status) ? 'info' : statusTone(ob.status);
@@ -141,6 +154,30 @@ export function DeliveryStatus({ message, now, tz }: DeliveryStatusProps) {
       void qc.invalidateQueries({ queryKey: queryKeys.threadsAll() });
     } catch (e) {
       toast.error(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const changeTime = async (at: number) => {
+    setBusy(true);
+    const toastId = toast.push({ message: t('mail.delivery.rescheduling'), durationMs: Number.POSITIVE_INFINITY });
+    try {
+      const updated = await reschedule(message.id, at);
+      // Show the new time right away; the refetch brings the rest (delivery events, list rows).
+      qc.setQueryData<ThreadDetail>(queryKeys.thread(message.thread_id), (old) =>
+        old && updated?.id === message.id ? { ...old, messages: old.messages.map((m) => (m.id === updated.id ? updated : m)) } : old,
+      );
+      void qc.invalidateQueries({ queryKey: queryKeys.thread(message.thread_id) });
+      void qc.invalidateQueries({ queryKey: queryKeys.threadsAll() });
+      void qc.invalidateQueries({ queryKey: queryKeys.counts() });
+      void qc.invalidateQueries({ queryKey: queryKeys.messageEvents(message.id) });
+      const when = updated?.outbound?.scheduled_at ?? at;
+      toast.push({ id: toastId, message: t('mail.delivery.rescheduled', { time: formatScheduleTime(when, now, tz) }) });
+    } catch (e) {
+      toast.push({ id: toastId, message: rescheduleErrorMessage(e), tone: 'error', durationMs: 8000 });
+      // The state may have moved on (sent meanwhile, schedule still being placed): refresh it.
+      void qc.invalidateQueries({ queryKey: queryKeys.thread(message.thread_id) });
     } finally {
       setBusy(false);
     }
@@ -196,10 +233,24 @@ export function DeliveryStatus({ message, now, tz }: DeliveryStatusProps) {
         </Button>
       )}
       {canCancel && (
+        <Button variant="text" size="sm" icon="schedule" disabled={busy} onClick={() => setPicking(true)}>
+          {t('mail.delivery.reschedule')}
+        </Button>
+      )}
+      {canCancel && (
         <Button variant="text" size="sm" icon="cancel_schedule_send" loading={busy} onClick={() => void cancel()}>
           {t('mail.delivery.cancelSchedule')}
         </Button>
       )}
+      <SchedulePicker
+        open={picking}
+        onOpenChange={setPicking}
+        timeZone={tz}
+        title={t('mail.delivery.reschedule')}
+        confirmLabel={t('mail.delivery.rescheduleConfirm')}
+        currentAt={ob.scheduled_at}
+        onSchedule={(at) => void changeTime(at)}
+      />
     </span>
   );
 }

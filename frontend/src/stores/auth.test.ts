@@ -12,7 +12,10 @@ import {
   logoutLocally,
   onExternalLogin,
   onUnauthorized,
+  emitUnauthorized,
+  handleUnauthorizedResponse,
   setToken,
+  signOut,
   TOKEN_KEY,
 } from './auth';
 import { useComposeStore } from './compose';
@@ -107,5 +110,69 @@ describe('auth store', () => {
     storageEvent(null, null); // localStorage.clear() elsewhere
     expect(getToken()).toBeNull();
     expect(reasons).toEqual(['other_tab', 'other_tab']);
+  });
+
+  // O1: 退出登录 must not end on "登录已过期，请重新登录" (main.tsx toasts only for expired / revoked).
+  describe('voluntary sign-out (O1, F9)', () => {
+    function listen() {
+      const reasons: string[] = [];
+      cleanups.push(onUnauthorized((r) => reasons.push(r)));
+      return reasons;
+    }
+
+    it('reports the server revoking the session during the logout POST as "logout", not as expiry', async () => {
+      setToken('tok');
+      const reasons = listen();
+      const qc = new QueryClient();
+      setCachedMe(qc, me);
+      await signOut(qc, async () => {
+        // The WS `session.revoked` frame for this very session arrives before the POST resolves,
+        // and a request in flight gets a 401 for the revoked token.
+        emitUnauthorized('revoked');
+        handleUnauthorizedResponse('tok');
+      });
+      expect(reasons).toEqual(['logout']);
+      expect(getToken()).toBeNull();
+      expect(getCachedMe(qc)).toBeUndefined();
+      // Late echoes after the logout (a revoked frame, a 401 for an old request) are ignored.
+      emitUnauthorized('revoked');
+      emitUnauthorized('expired');
+      handleUnauthorizedResponse('tok');
+      expect(reasons).toEqual(['logout']);
+    });
+
+    it('logs out locally as "logout" when the POST fails', async () => {
+      setToken('tok');
+      const reasons = listen();
+      await signOut(new QueryClient(), async () => {
+        throw new Error('offline');
+      });
+      expect(reasons).toEqual(['logout']);
+      expect(getToken()).toBeNull();
+    });
+
+    it('saves open drafts first (while the token is still valid), never blocking the logout', async () => {
+      setToken('tok');
+      const order: string[] = [];
+      await signOut(
+        new QueryClient(),
+        async () => order.push(`post:${getToken()}`),
+        async () => {
+          order.push(`flush:${getToken()}`);
+          throw new Error('save failed');
+        },
+      );
+      expect(order).toEqual(['flush:tok', 'post:tok']);
+      expect(getToken()).toBeNull();
+    });
+
+    it('a real expiry (401 / revoked outside a sign-out) is still "expired" / "revoked"', () => {
+      const reasons = listen();
+      setToken('tok');
+      handleUnauthorizedResponse('tok');
+      setToken('tok2');
+      emitUnauthorized('revoked');
+      expect(reasons).toEqual(['expired', 'revoked']);
+    });
   });
 });

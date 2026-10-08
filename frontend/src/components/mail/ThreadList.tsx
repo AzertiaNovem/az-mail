@@ -56,7 +56,7 @@ export function ThreadList({ view, active = true }: { view: ListView; active?: b
   const selected = useUiStore(selectSelection(scope));
   const cursorId = useUiStore((s) => s.cursorId);
   const density = useUiStore((s) => s.density);
-  const { data, isPending, isError, isFetching, refetch } = useThreadList(view.filter, cursor, pageSize);
+  const { data, isPending, isError, isFetching, isPlaceholderData, refetch } = useThreadList(view.filter, cursor, pageSize);
   const labels = useLabels().data;
   const tz = useTimeZone();
   const now = useNow();
@@ -70,6 +70,12 @@ export function ThreadList({ view, active = true }: { view: ListView; active?: b
   const ids = useMemo(() => items.map((i) => i.id), [items]);
   const labelsById = useMemo(() => new Map<number, Label>((labels ?? []).map((l) => [l.id, l])), [labels]);
   const offset = pageIndex * pageSize;
+
+  // 每页显示 changed (here or in settings): the cursor stacks and every cached page were built
+  // with the old size, so offsets and rows would no longer match. Start over at page 1.
+  useLayoutEffect(() => {
+    if (useUiStore.getState().syncPageSize(pageSize)) void qc.resetQueries({ queryKey: queryKeys.threadsAll() });
+  }, [pageSize, qc]);
 
   // Publish the visible page for the thread view (j/k, "第 3 封，共 50 封") and keep the
   // selection to visible rows.
@@ -288,10 +294,12 @@ export function ThreadList({ view, active = true }: { view: ListView; active?: b
           count: items.length,
           total: data?.total ?? null,
           hasNewer: pageIndex > 0,
-          hasOlder: !!data?.next_cursor,
+          // While the next page loads, `data` is still the previous page (placeholder): its
+          // next_cursor is the one just pushed, so a second click must not push it again.
+          hasOlder: !!data?.next_cursor && !isPlaceholderData,
           onNewer: () => useUiStore.getState().popPage(scope),
           onOlder: () => {
-            if (data?.next_cursor) useUiStore.getState().pushPage(scope, data.next_cursor);
+            if (data?.next_cursor && !isPlaceholderData && data.next_cursor !== cursor) useUiStore.getState().pushPage(scope, data.next_cursor);
           },
         }}
       />

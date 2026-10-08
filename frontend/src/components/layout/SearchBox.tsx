@@ -7,6 +7,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import { cx, IconButton } from '@/components/common';
 import { t } from '@/i18n/zh';
+import { isImeKeyEvent } from '@/lib/keyboard';
 import { useUiStore } from '@/stores/ui';
 import { AdvancedSearch } from './AdvancedSearch';
 
@@ -63,7 +64,7 @@ export function SearchBox({ className }: { className?: string }) {
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Escape') {
+            if (e.key === 'Escape' && !isImeKeyEvent(e)) {
               e.preventDefault();
               inputRef.current?.blur();
             }

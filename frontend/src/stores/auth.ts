@@ -75,8 +75,22 @@ export function onExternalLogin(listener: ExternalLoginListener): () => void {
   return () => externalLoginListeners.delete(listener);
 }
 
-/** Clears the token (if still present) and notifies listeners. */
+/** True while `signOut` runs: the server ending the session then is the user's own logout. */
+let signingOut = false;
+
+/**
+ * Clears the token (if still present) and notifies listeners.
+ *
+ * - During a voluntary sign-out, the server revoking the session (WS `session.revoked`, a 401
+ *   for a request in flight) is reported as 'logout', not as an expired session.
+ * - 'expired' / 'revoked' after the session already ended locally (no token: logged out here or
+ *   in another tab) are late echoes of that logout and are ignored.
+ */
 export function emitUnauthorized(reason: UnauthorizedReason): void {
+  if (reason === 'expired' || reason === 'revoked') {
+    if (signingOut) reason = 'logout';
+    else if (getToken() === null) return;
+  }
   if (getToken() !== null) clearToken();
   for (const l of [...unauthorizedListeners]) {
     try {
@@ -138,6 +152,36 @@ export function installComposeOwnerSync(qc: QueryClient): () => void {
 export function logoutLocally(qc: QueryClient, reason: UnauthorizedReason = 'logout'): void {
   qc.clear();
   emitUnauthorized(reason);
+}
+
+/**
+ * Voluntary logout (账号菜单 → 退出登录): `beforeLogout` (save open drafts while the token is
+ * still valid), POST /api/auth/logout (`postLogout`; failures ignored), then the local logout
+ * — reported as 'logout' even when the server's revocation reached the app first (the
+ * `session.revoked` frame for this session usually arrives before the POST's response).
+ */
+export async function signOut(
+  qc: QueryClient,
+  postLogout: () => Promise<unknown>,
+  beforeLogout?: () => Promise<unknown>,
+): Promise<void> {
+  try {
+    await beforeLogout?.();
+  } catch {
+    /* never blocks the logout */
+  }
+  signingOut = true;
+  try {
+    try {
+      await postLogout();
+    } catch {
+      /* the local session ends regardless */
+    }
+    if (getToken() !== null) logoutLocally(qc, 'logout');
+    else qc.clear(); // the revocation already ended it (as 'logout')
+  } finally {
+    signingOut = false;
+  }
 }
 
 // ───────────── multi-tab sync ─────────────

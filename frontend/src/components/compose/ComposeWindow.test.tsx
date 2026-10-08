@@ -1,13 +1,13 @@
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import type { Editor } from '@tiptap/core';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/client';
 import * as endpoints from '@/api/endpoints';
 import { queryKeys } from '@/api/queryKeys';
 import type { Draft, DraftInput, DraftSendRequest, DraftUpdateInput, SendResult } from '@/api/types';
 import { useComposeStore } from '@/stores/compose';
 import { toast, useToastStore } from '@/stores/toast';
-import { ComposeDock } from './ComposeDock';
+import { ComposeDock, preloadComposeWindow } from './ComposeDock';
 import {
   fakeFile,
   installEditorDomPolyfills,
@@ -74,6 +74,11 @@ function typeTo(text: string) {
   fireEvent.change(toInput(), { target: { value: text } });
   fireEvent.blur(toInput());
 }
+
+// The window module is a lazy chunk (F13): load it once so every window renders its form directly.
+beforeAll(async () => {
+  await preloadComposeWindow();
+});
 
 beforeEach(() => {
   version = 0;
