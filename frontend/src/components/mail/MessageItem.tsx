@@ -129,8 +129,15 @@ export function MessageItem(props: MessageItemProps) {
         className="flex cursor-pointer items-center gap-3 border-b border-divider px-4 py-3 hover:bg-hover sm:px-6"
       >
         <Avatar name={m.from.name} email={m.from.email} size={40} decorative />
-        <span className={cx('min-w-0 flex-1 truncate text-sm sm:w-[180px] sm:flex-none sm:shrink-0', unread ? 'font-bold text-on-surface' : 'text-on-surface')}>{name}</span>
-        <span className="hidden min-w-0 flex-1 truncate text-sm text-on-surface-variant sm:block">{m.snippet}</span>
+        {/* Phones / narrow panes: the snippet goes on a second line under the sender (Gmail). */}
+        <span className="flex min-w-0 flex-1 flex-col sm:flex-row sm:items-center sm:gap-3">
+          <span className={cx('min-w-0 truncate text-sm sm:w-[180px] sm:shrink-0', unread ? 'font-bold text-on-surface' : 'text-on-surface')}>{name}</span>
+          {m.snippet && (
+            <span data-testid="message-snippet" className="block min-w-0 truncate text-sm text-on-surface-variant sm:flex-1">
+              {m.snippet}
+            </span>
+          )}
+        </span>
         {m.attachments.length > 0 && <Icon name="attach_file" size={16} className="text-on-surface-variant" />}
         {m.is_starred && <Icon name="star" size={16} fill className="text-star" />}
         <span className={cx('shrink-0 text-xs', unread ? 'font-bold text-on-surface' : 'text-on-surface-variant')} title={formatFullDate(m.date, tz)}>

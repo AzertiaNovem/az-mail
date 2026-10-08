@@ -53,6 +53,8 @@ export interface UiState {
 
   /** Pager cursor stack per list scope: [] = page 1; the last element is the current page's cursor. */
   pages: Record<string, string[]>;
+  /** Page size the cursor stacks were built with (null until a list rendered). */
+  pagesPageSize: number | null;
 
   shortcutsHelpOpen: boolean;
   /** Incremented to ask the search box to take focus (shortcut "/"). */
@@ -76,9 +78,15 @@ export interface UiState {
   setList(ctx: ListContext): void;
   setCursor(id: number | null): void;
 
+  /** Pushes `cursor` (a no-op when it already is the current page's cursor: double clicks). */
   pushPage(scope: string, cursor: string): void;
   popPage(scope: string): void;
   resetPages(scope: string): void;
+  /**
+   * Records the page size the stacks are built with; a different size than before drops every
+   * stack (their offsets no longer match). Returns true when the stacks were reset.
+   */
+  syncPageSize(pageSize: number): boolean;
 
   setShortcutsHelpOpen(v: boolean): void;
   requestSearchFocus(): void;
@@ -108,6 +116,7 @@ export function createUiStore(storage: () => StateStorage = localStorageOrNoop) 
         list: null,
         cursorId: null,
         pages: {},
+        pagesPageSize: null,
         shortcutsHelpOpen: false,
         searchFocusTick: 0,
 
@@ -187,11 +196,25 @@ export function createUiStore(storage: () => StateStorage = localStorageOrNoop) 
 
         setCursor: (id) => set({ cursorId: id }),
 
-        pushPage: (scope, cursor) => set((s) => ({ pages: { ...s.pages, [scope]: [...(s.pages[scope] ?? []), cursor] } })),
+        pushPage: (scope, cursor) => {
+          const stack = get().pages[scope] ?? [];
+          if (stack[stack.length - 1] === cursor) return;
+          set((s) => ({ pages: { ...s.pages, [scope]: [...(s.pages[scope] ?? []), cursor] } }));
+        },
         popPage: (scope) => set((s) => ({ pages: { ...s.pages, [scope]: (s.pages[scope] ?? []).slice(0, -1) } })),
         resetPages: (scope) => {
           if ((get().pages[scope] ?? []).length === 0) return;
           set((s) => ({ pages: { ...s.pages, [scope]: [] } }));
+        },
+        syncPageSize: (pageSize) => {
+          const prev = get().pagesPageSize;
+          if (prev === pageSize) return false;
+          if (prev === null) {
+            set({ pagesPageSize: pageSize });
+            return false;
+          }
+          set({ pagesPageSize: pageSize, pages: {} });
+          return true;
         },
 
         setShortcutsHelpOpen: (v) => set({ shortcutsHelpOpen: v }),

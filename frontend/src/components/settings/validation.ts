@@ -5,6 +5,7 @@
 import type { Settings } from '@/api/types';
 import { t } from '@/i18n/zh';
 import { isBlankHtml } from '@/lib/emailHtml';
+import { LABEL_NAME_MAX, labelNameLength } from '@/lib/labelName';
 
 export const DISPLAY_NAME_MAX = 100;
 /** Server limit for signature_html (repo::SettingsPatch, ≤ 64 KiB). */
@@ -14,7 +15,8 @@ export const PAGE_SIZE_OPTIONS = [10, 15, 20, 25, 50, 100] as const;
 export const PAGE_SIZE_MIN = 10;
 export const PAGE_SIZE_MAX = 100;
 export const PASSWORD_MIN = 8;
-export const LABEL_NAME_MAX = 100;
+/** Server limit (64 code points), shared with the mail-side label dialog. */
+export { LABEL_NAME_MAX };
 
 /** The editable part of Settings (everything the general tab shows). */
 export type GeneralForm = Pick<
@@ -117,7 +119,7 @@ export function validatePasswordChange(f: PasswordForm): PasswordErrors {
 export function validateLabelName(name: string): string | null {
   const n = name.trim();
   if (!n) return t('settings.labels.nameRequired');
-  if (Array.from(n).length > LABEL_NAME_MAX) return t('settings.labels.nameTooLong', { max: LABEL_NAME_MAX });
+  if (labelNameLength(n) > LABEL_NAME_MAX) return t('settings.labels.nameTooLong', { max: LABEL_NAME_MAX });
   return null;
 }
 

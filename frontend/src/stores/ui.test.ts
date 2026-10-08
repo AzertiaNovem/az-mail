@@ -89,4 +89,28 @@ describe('ui store', () => {
     expect(junk.getState().sidebarCollapsed).toBe(false);
     expect(junk.getState().density).toBe('default');
   });
+
+  it('F6: pushing the current page cursor again (double-click on 较旧) is a no-op', () => {
+    const s = createUiStore(() => memoryStorage());
+    const st = () => s.getState();
+    st().pushPage('folder:inbox', 'C1');
+    st().pushPage('folder:inbox', 'C1');
+    expect(st().pages['folder:inbox']).toEqual(['C1']);
+    st().pushPage('folder:inbox', 'C2');
+    expect(selectPageIndex('folder:inbox')(st())).toBe(2);
+  });
+
+  it('F11: a different page size drops every cursor stack (offsets no longer match)', () => {
+    const s = createUiStore(() => memoryStorage());
+    const st = () => s.getState();
+    expect(st().syncPageSize(50)).toBe(false); // first list: just records it
+    st().pushPage('folder:inbox', 'C1');
+    st().pushPage('label:3', 'L1');
+    expect(st().syncPageSize(50)).toBe(false);
+    expect(selectPageIndex('folder:inbox')(st())).toBe(1);
+    expect(st().syncPageSize(25)).toBe(true);
+    expect(st().pages).toEqual({});
+    expect(st().pagesPageSize).toBe(25);
+  });
 });
+

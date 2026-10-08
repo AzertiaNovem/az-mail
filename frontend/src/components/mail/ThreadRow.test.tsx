@@ -71,6 +71,41 @@ describe('participants column', () => {
   });
 });
 
+describe('Sent / Scheduled rows show the recipients (F16)', () => {
+  const p = (name: string, email: string, is_me = false) => ({ name, email, is_me });
+  const sender = [{ name: 'Alice', email: 'alice@team.test', is_me: true, unread: false }];
+
+  it('"收件人：王五" in Sent and Scheduled; every other folder keeps the senders', () => {
+    const row = item(1, { participants: sender, to_preview: [p('王五', 'ww@x.test')] });
+    expect(participantsView(row, 'sent')).toMatchObject({ prefix: '收件人：', parts: [{ text: '王五' }], title: '收件人：王五 <ww@x.test>' });
+    expect(participantsView(row, 'scheduled').prefix).toBe('收件人：');
+    expect(participantsView(row, 'inbox')).toMatchObject({ prefix: null, parts: [{ text: '我' }] });
+    expect(participantsView(row, null).prefix).toBeNull();
+  });
+
+  it('abbreviates several recipients, marks me and keeps the draft marker and count', () => {
+    const row = item(1, {
+      participants: sender,
+      message_count: 2,
+      draft_count: 1,
+      to_preview: [p('Bob Smith', 'b@x'), p('王五', 'w@x'), p('Carol Jones', 'c@x'), p('Alice', 'alice@team.test', true)],
+    });
+    const v = participantsView(row, 'sent');
+    expect(v.parts.map((x) => x.text)).toEqual(['Bob', '..', 'Carol', '我', '草稿']);
+    expect(v.count).toBe(3);
+  });
+
+  it('older servers without to_preview (or no outbound mail) fall back to the senders', () => {
+    expect(participantsView(item(1, { participants: sender }), 'sent')).toMatchObject({ prefix: null, parts: [{ text: '我' }] });
+    expect(participantsView(item(1, { participants: sender, to_preview: [] }), 'sent').prefix).toBeNull();
+  });
+
+  it('renders the prefix in the row', () => {
+    renderRow({ participants: sender, to_preview: [p('王五', 'ww@x.test')] }, { folder: 'sent', href: '/mail/sent/7' });
+    expect(screen.getByTitle('收件人：王五 <ww@x.test>')).toHaveTextContent('收件人：王五');
+  });
+});
+
 describe('status chips', () => {
   it('labels scheduled, failed, delayed and pending sends', () => {
     expect(rowStatusChip(item(1, { scheduled_at: Date.UTC(2026, 9, 8, 1, 0), latest_status: 'scheduled' }), 'sent', NOW, SH)).toEqual({

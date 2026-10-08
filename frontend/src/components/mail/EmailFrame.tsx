@@ -3,13 +3,17 @@
  *
  * The HTML is sanitized (lib/sanitize.ts), wrapped in a srcdoc with its own CSP
  * (lib/emailFrame.ts) and shown in an iframe without `allow-scripts`. Same-origin access lets
- * this component size the frame to its content (ResizeObserver + image load events) and turn
- * mailto: clicks into a compose window. The trailing quoted block starts collapsed behind "…".
+ * this component size the frame to its content (ResizeObserver + image load events), turn
+ * mailto: clicks into a compose window, and keep the Gmail shortcuts working while focus is
+ * inside the frame (a click into the body moves keyboard focus into its browsing context, so
+ * the app's window listener would never see the keys). The trailing quoted block starts
+ * collapsed behind "…".
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Icon, Tooltip } from '@/components/common';
 import { t } from '@/i18n/zh';
 import { buildSrcDoc, EMAIL_FRAME_SANDBOX, frameFilesOrigins, measureContentHeight, parseMailto, type MailtoParts } from '@/lib/emailFrame';
+import { installShortcutListener } from '@/lib/keyboard';
 import { sanitizeEmailHtml, type SanitizeResult } from '@/lib/sanitize';
 
 export interface EmailContent {
@@ -104,6 +108,9 @@ export function EmailFrame({ content, title, onMailto }: EmailFrameProps) {
       if (parts) mailtoRef.current?.(parts);
     };
     doc.addEventListener('click', onClick);
+    // Keys typed while the frame has focus go to the frame's window: dispatch them as shortcuts too.
+    const frameWin = frame.contentWindow;
+    const stopKeys = frameWin ? installShortcutListener(frameWin) : null;
     const win = frame.ownerDocument.defaultView;
     win?.addEventListener('resize', measure);
     // Late layout changes (web fonts, slow images without load events) settle within a few seconds.
@@ -117,6 +124,7 @@ export function EmailFrame({ content, title, onMailto }: EmailFrameProps) {
         img.removeEventListener('error', measure);
       }
       doc.removeEventListener('click', onClick);
+      stopKeys?.();
       win?.removeEventListener('resize', measure);
       for (const id of timers) clearTimeout(id);
       measureRef.current = null;

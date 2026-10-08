@@ -11,7 +11,7 @@ import { errorMessage, isApiError } from '@/api/client';
 import { adminDeleteAlias, adminKeys, adminListAliases, adminListDomains, adminListUsers } from '@/api/admin';
 import { staleTimes } from '@/api/queryKeys';
 import type { AdminAlias } from '@/api/types';
-import { AdminToolbar, Chip, QueryState, useAdminTimeZone } from '@/components/admin/AdminUi';
+import { AdminToolbar, Chip, EmailAddress, QueryState, useAdminTimeZone } from '@/components/admin/AdminUi';
 import { AliasDialog } from '@/components/admin/AliasDialog';
 import { formatDateTime } from '@/components/admin/format';
 import { Button, ConfirmDialog, IconButton } from '@/components/common';
@@ -54,11 +54,11 @@ export function AdminAliases() {
       <QueryState query={aliases} empty={t('admin.aliases.empty')}>
         {(list) => (
           <div className="azm-table-wrap">
-            <table className="azm-table">
+            <table className="azm-table min-w-[640px]">
               <thead>
                 <tr>
-                  <th>{t('admin.aliases.email')}</th>
-                  <th>{t('admin.aliases.members')}</th>
+                  <th className="min-w-[12rem]">{t('admin.aliases.email')}</th>
+                  <th className="min-w-[10rem]">{t('admin.aliases.members')}</th>
                   <th>{t('admin.aliases.shareSent')}</th>
                   <th>{t('admin.domains.createdAt')}</th>
                   <th className="text-right">{t('admin.common.actions')}</th>
@@ -68,8 +68,8 @@ export function AdminAliases() {
                 {list.map((a) => (
                   <tr key={a.id}>
                     <td>
-                      <span className="block font-medium break-all">{a.email}</span>
-                      {a.display_name && <span className="block text-xs text-on-surface-variant">{a.display_name}</span>}
+                      <EmailAddress email={a.email} className="block font-medium" />
+                      {a.display_name && <span className="block truncate text-xs text-on-surface-variant">{a.display_name}</span>}
                     </td>
                     <td className="py-2">
                       {a.members.length === 0 ? (
@@ -85,7 +85,7 @@ export function AdminAliases() {
                         </span>
                       )}
                     </td>
-                    <td>{a.share_sent ? t('admin.common.yes') : t('admin.common.no')}</td>
+                    <td className="whitespace-nowrap">{a.share_sent ? t('admin.common.yes') : t('admin.common.no')}</td>
                     <td className="whitespace-nowrap text-on-surface-variant">{formatDateTime(a.created_at, tz)}</td>
                     <td className="text-right whitespace-nowrap">
                       <IconButton

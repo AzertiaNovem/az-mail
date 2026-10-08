@@ -54,7 +54,11 @@ describe('password change validation', () => {
 describe('labels and time zones', () => {
   it('validates label names', () => {
     expect(validateLabelName('  ')).toBe('请输入标签名称');
-    expect(validateLabelName('x'.repeat(101))).toBe('标签名称不能超过 100 个字符');
+    // The server limit: 64 code points (repo/accounts.cpp kMaxLabelName), counted as code points.
+    expect(validateLabelName('x'.repeat(65))).toBe('标签名称不能超过 64 个字符');
+    expect(validateLabelName('x'.repeat(64))).toBeNull();
+    expect(validateLabelName('😀'.repeat(64))).toBeNull(); // 128 UTF-16 units, 64 characters
+    expect(validateLabelName('😀'.repeat(65))).toBe('标签名称不能超过 64 个字符');
     expect(validateLabelName('财务/报销')).toBeNull();
   });
 

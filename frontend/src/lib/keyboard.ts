@@ -1,8 +1,9 @@
 /**
  * Gmail keyboard shortcuts [WP-E].
  *
- * One global keydown listener (`installShortcutListener`, mounted by AppShell) normalizes the
- * key, applies the guards (typing in inputs / editors, IME composition, modifier chords, open
+ * One global keydown listener (`installShortcutListener`, mounted by AppShell — and on each
+ * same-origin email iframe by EmailFrame, so shortcuts keep working after a click into a
+ * message body) normalizes the key, applies the guards (typing in inputs / editors, IME composition, modifier chords, open
  * dialogs / menus, the compose dock) and dispatches an action to the most recently registered
  * layer that handles it (`registerShortcuts` / `useShortcuts`): AppShell registers the global
  * ones (c, /, ?, g-sequences), the thread list and the thread view register theirs on top.
@@ -112,14 +113,26 @@ export const SHORTCUT_HELP: readonly {
 
 const NON_TEXT_INPUTS = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'range', 'color', 'file', 'image']);
 
+/**
+ * Element check that also works across realms: key events from the same-origin email iframe
+ * (EmailFrame installs this listener on the frame window) carry targets from the frame's
+ * document, which are not `instanceof` the parent window's `Element`.
+ */
+function asElement(target: EventTarget | null): Element | null {
+  if (!target || typeof target !== 'object') return null;
+  const node = target as Partial<Element> & { nodeType?: number };
+  return node.nodeType === 1 && typeof node.closest === 'function' ? (target as Element) : null;
+}
+
 /** Typing targets: text inputs, textareas, selects and anything contenteditable. */
 export function isEditableTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof Element)) return false;
-  const tag = target.tagName;
+  const el = asElement(target);
+  if (!el) return false;
+  const tag = el.tagName;
   if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
-  if (tag === 'INPUT') return !NON_TEXT_INPUTS.has(((target as HTMLInputElement).type || 'text').toLowerCase());
-  if ((target as HTMLElement).isContentEditable) return true;
-  return target.closest('[contenteditable]:not([contenteditable="false"])') !== null;
+  if (tag === 'INPUT') return !NON_TEXT_INPUTS.has(((el as HTMLInputElement).type || 'text').toLowerCase());
+  if ((el as HTMLElement).isContentEditable) return true;
+  return el.closest('[contenteditable]:not([contenteditable="false"])') !== null;
 }
 
 /** Shortcuts never fire inside these (dialogs, menus, popovers, the compose dock). */
@@ -129,17 +142,28 @@ const BLOCKING_CONTAINERS =
 /** Focusable controls whose own Enter / Space behaviour must win. */
 const INTERACTIVE = 'button,a[href],[role="button"],[role="checkbox"],[role="menuitem"],[role="tab"],[role="switch"],summary';
 
+/**
+ * A keydown that belongs to an IME composition (Chinese / Japanese input methods): the Enter
+ * that confirms the candidate, the Esc that cancels it, Backspace inside the composition…
+ * Chrome reports `isComposing`; Safari sends keyCode 229 (also right after compositionend).
+ * Accepts DOM and React keyboard events.
+ */
+export function isImeKeyEvent(e: { isComposing?: boolean; keyCode?: number; nativeEvent?: { isComposing?: boolean; keyCode?: number } }): boolean {
+  return !!(e.isComposing || e.nativeEvent?.isComposing || e.keyCode === 229 || e.nativeEvent?.keyCode === 229);
+}
+
 /** Whether a keydown must be left alone. */
 export function shouldIgnoreKeyEvent(e: KeyboardEvent): boolean {
   if (e.defaultPrevented) return true;
   // IME composition (Chinese input methods): keyCode 229 while composing.
-  if (e.isComposing || e.keyCode === 229) return true;
+  if (isImeKeyEvent(e)) return true;
   if (e.ctrlKey || e.metaKey || e.altKey) return true;
   const target = e.target;
   if (isEditableTarget(target)) return true;
-  if (target instanceof Element) {
-    if (target.closest(BLOCKING_CONTAINERS)) return true;
-    if ((e.key === 'Enter' || e.key === ' ') && target.closest(INTERACTIVE)) return true;
+  const el = asElement(target);
+  if (el) {
+    if (el.closest(BLOCKING_CONTAINERS)) return true;
+    if ((e.key === 'Enter' || e.key === ' ') && el.closest(INTERACTIVE)) return true;
   }
   return false;
 }
@@ -226,7 +250,7 @@ export function createKeydownHandler(opts: KeydownHandlerOptions = {}): (e: Keyb
   };
 }
 
-/** Installs the global listener; returns the uninstall function. */
+/** Installs the listener on a window (the app's, or an email iframe's); returns the uninstall function. */
 export function installShortcutListener(target: Pick<Window, 'addEventListener' | 'removeEventListener'> = window) {
   const handler = createKeydownHandler();
   target.addEventListener('keydown', handler as EventListener);

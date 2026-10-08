@@ -23,7 +23,7 @@ import {
 } from '@/api/admin';
 import { staleTimes } from '@/api/queryKeys';
 import type { InboundRow } from '@/api/types';
-import { AdminToolbar, Chip, OutboundStatusChip, QueryState, useAdminTimeZone } from '@/components/admin/AdminUi';
+import { AdminToolbar, Chip, EmailAddress, OutboundStatusChip, QueryState, useAdminTimeZone } from '@/components/admin/AdminUi';
 import { formatBytes, formatDateTime } from '@/components/admin/format';
 import { Button, Icon, IconButton } from '@/components/common';
 import { t, zh } from '@/i18n/zh';
@@ -196,11 +196,11 @@ function InboundView() {
                 {rows.map((r) => (
                   <tr key={r.id}>
                     <td className="whitespace-nowrap">{formatDateTime(r.received_at ?? r.created_at, tz)}</td>
-                    <td className="break-all">{r.from_email ?? t('admin.common.none')}</td>
+                    <td>{r.from_email ? <EmailAddress email={r.from_email} /> : t('admin.common.none')}</td>
                     <td className="max-w-[240px] truncate" title={r.subject ?? ''}>
                       {r.subject || t('common.noSubject')}
                     </td>
-                    <td className="max-w-[220px] text-xs break-all">{r.recipients.join(', ') || t('admin.common.none')}</td>
+                    <td className="max-w-[220px] text-xs [overflow-wrap:anywhere]">{r.recipients.join(', ') || t('admin.common.none')}</td>
                     <td>
                       <Chip tone={INBOUND_TONES[r.state]}>{labels.states[r.state]}</Chip>
                     </td>

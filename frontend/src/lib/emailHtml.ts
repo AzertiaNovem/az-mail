@@ -48,12 +48,27 @@ export interface InitialBodyOptions {
   signatureHtml: string;
   signatureEnabled: boolean;
   filesOrigins?: string[];
+  /** Plain text to start with (a mailto: link's `body`), one paragraph per line. */
+  text?: string;
 }
 
-/** Body of a brand-new message / reply / forward: two empty lines, then the signature (if enabled). */
-export function initialBodyHtml({ signatureHtml, signatureEnabled, filesOrigins = [] }: InitialBodyOptions): string {
+/** Plain text as editor paragraphs (one `<p>` per line, escaped). */
+export function plainTextParagraphs(text: string): string {
+  return text
+    .split(/\r\n|\r|\n/)
+    .map((line) => `<p>${escapeHtml(line)}</p>`)
+    .join('');
+}
+
+/**
+ * Body of a brand-new message / reply / forward: two empty lines (or the given text and an
+ * empty line), then the signature exactly once if enabled. The quote of a reply / forward lives
+ * outside the editor, so the signature always ends up above it.
+ */
+export function initialBodyHtml({ signatureHtml, signatureEnabled, filesOrigins = [], text }: InitialBodyOptions): string {
   const sig = signatureEnabled ? signatureBlockHtml(signatureHtml, filesOrigins) : '';
-  return `<p></p><p></p>${sig}`;
+  const lead = text && text.trim() !== '' ? `${plainTextParagraphs(text)}<p></p>` : '<p></p><p></p>';
+  return `${lead}${sig}`;
 }
 
 export function hasSignatureBlock(html: string): boolean {

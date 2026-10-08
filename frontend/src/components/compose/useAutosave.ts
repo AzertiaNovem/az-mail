@@ -12,6 +12,8 @@
  * - Other failures are retried with backoff while there are unsaved edits.
  * - Before a send, `prepareSend` waits for in-flight saves and makes sure the draft exists; the
  *   send request carries the final fields itself, so pending edits need no extra PUT.
+ * - Every mounted saver is registered by window key, so a voluntary logout can save all open
+ *   drafts first (`flushAllDrafts`) while the session token is still valid.
  *
  * `DraftAutosaver` is framework-free (unit-tested with fake timers); `useAutosave` binds it to
  * the compose store (saveState / draftId) and the `['draft', id]` cache.
@@ -168,6 +170,9 @@ export class DraftAutosaver {
       const r = await this.run();
       if (r === 'conflict') throw new DraftConflictError(this.conflict ?? null);
       if (r === 'error') throw this.lastError;
+      // Edits recorded while the draft was being created (or by onSaved) travel with the send
+      // itself; an autosave PUT racing the send would only cause a version conflict.
+      this.clearTimer();
     }
     return { draftId: this._draftId as number, version: this._version };
   }
@@ -313,8 +318,36 @@ export interface UseAutosaveOptions {
   createFields: () => DraftInput;
   onConflict: (current: Draft | null) => void;
   onError?: (error: unknown) => void;
+  /**
+   * After every successful save (`created` on the first POST). Runs synchronously inside the
+   * save, before `flush` / `prepareSend` resolve, so field updates made here (e.g. adopting the
+   * attachments the server copied onto a forward) are in the next `collect()`.
+   */
+  onSaved?: (draft: Draft, created: boolean) => void;
   api?: AutosaveApi;
   debounceMs?: number;
+}
+
+// ───────────── open savers (logout) ─────────────
+
+const liveSavers = new Map<string, DraftAutosaver>();
+
+/**
+ * Saves the pending edits of every open compose window (before a voluntary logout revokes the
+ * token). Resolves after all saves settled or `timeoutMs`, whichever comes first; never rejects.
+ */
+export async function flushAllDrafts(timeoutMs = 5000): Promise<void> {
+  const pending = [...liveSavers.values()].filter((s) => s.dirty || s.saving).map((s) => s.flush());
+  if (pending.length === 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  try {
+    await Promise.race([Promise.allSettled(pending).then(() => undefined), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -340,16 +373,22 @@ export function useAutosave(opts: UseAutosaveOptions): DraftAutosaver {
           useComposeStore.getState().patch(winKey, { draftId: draft.id });
           void qc.invalidateQueries({ queryKey: queryKeys.counts() });
         }
+        opts.onSaved?.(draft, created);
       },
       onConflict: opts.onConflict,
       onError: opts.onError,
     });
   });
 
+  const { winKey } = opts;
   useEffect(() => {
     saver.activate();
-    return () => saver.dispose();
-  }, [saver]);
+    liveSavers.set(winKey, saver);
+    return () => {
+      saver.dispose();
+      if (liveSavers.get(winKey) === saver) liveSavers.delete(winKey);
+    };
+  }, [saver, winKey]);
 
   // Warn before leaving the page with unsaved edits.
   useEffect(() => {

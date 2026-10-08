@@ -104,6 +104,7 @@ function Participants({ item, folder, className }: { item: ThreadListItem; folde
   const view = participantsView(item, folder);
   return (
     <span className={cx('min-w-0 truncate', className)} title={view.title}>
+      {view.prefix && <span className="font-normal">{view.prefix}</span>}
       {view.parts.map((p, i) => (
         <span key={i}>
           {i > 0 && !p.ellipsis && !view.parts[i - 1]?.ellipsis && <span className="font-normal">, </span>}
@@ -181,7 +182,7 @@ export const ThreadRow = memo(function ThreadRow(props: ThreadRowProps) {
   const view = participantsView(item, folder);
   const ariaLabel = [
     item.unread ? t('mail.list.unreadRow') : '',
-    view.parts.map((p) => p.text).join('，'),
+    (view.prefix ?? '') + view.parts.map((p) => p.text).join('，'),
     displaySubject(item.subject),
     item.snippet,
     item.has_attachments ? t('mail.list.hasAttachment') : '',

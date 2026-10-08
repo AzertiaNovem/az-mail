@@ -10,8 +10,11 @@ import { SIGNATURE_ATTR, signatureBlockHtml } from '@/lib/emailHtml';
 declare module '@tiptap/core' {
   interface Commands<ReturnType> {
     signature: {
-      /** Replaces any signature block with `html`, appended at the end of the body. */
-      setSignature: (html: string) => ReturnType;
+      /**
+       * Replaces any signature block with one copy of `html`, at the end of the body (which is
+       * above the quote: the quote lives outside the editor). `filesOrigins` = Me.server.files_origins.
+       */
+      setSignature: (html: string, filesOrigins?: string[]) => ReturnType;
       /** Removes every signature block. */
       removeSignature: () => ReturnType;
     };
@@ -60,9 +63,9 @@ export const Signature = Node.create({
           return true;
         },
       setSignature:
-        (html) =>
+        (html, filesOrigins = []) =>
         ({ tr, dispatch, commands }) => {
-          const block = signatureBlockHtml(html);
+          const block = signatureBlockHtml(html, filesOrigins);
           if (!block) return false;
           if (dispatch) {
             for (const [from, to] of signatureRanges(tr.doc)) tr.delete(from, to);

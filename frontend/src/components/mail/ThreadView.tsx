@@ -2,8 +2,10 @@
  * Thread view [WP-E]: toolbar, subject + label chips, stacked messages (older read ones
  * collapsed, "显示 N 封较早的邮件" for long threads, last + unread expanded), drafts as "草稿"
  * rows that open compose, delivery status, attachments, and the 回复 / 回复全部 / 转发 bar.
- * Opening the thread marks it read immediately (optimistic); a draft-only thread opens its
- * draft in compose instead. Keyboard: u j k e # ! s Shift+I Shift+U r a f.
+ * Opening the thread marks it read immediately (optimistic), and so does a message that arrives
+ * while the thread is on screen; a draft-only thread opens its draft in compose instead.
+ * Like Gmail, the newest message is always expanded — also a reply just sent from here, whose
+ * id was already known as a draft. Keyboard: u j k e # ! s Shift+I Shift+U r a f.
  */
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
@@ -11,7 +13,7 @@ import { useNavigate } from 'react-router';
 import { errorMessage, isApiError } from '@/api/client';
 import { updateSettings } from '@/api/endpoints';
 import { queryKeys } from '@/api/queryKeys';
-import type { Attachment, FolderId, Label, Me, Message, ThreadAction } from '@/api/types';
+import type { Attachment, FolderId, Label, Me, Message, ThreadAction, ThreadDetail } from '@/api/types';
 import { Button, ConfirmDialog, Icon, IconButton } from '@/components/common';
 import { t } from '@/i18n/zh';
 import type { MailtoParts } from '@/lib/emailFrame';
@@ -21,7 +23,7 @@ import { toast } from '@/stores/toast';
 import { useUiStore } from '@/stores/ui';
 import { replyAllCount } from './addressing';
 import { AttachmentPreview } from './AttachmentPreview';
-import { draftOnlyTarget, openDraft, openNewMessage, openReply, replyTarget, type ReplyKind } from './compose';
+import { draftOnlyTarget, openDraft, openMailto, openReply, replyTarget, type ReplyKind } from './compose';
 import { LabelChip } from './LabelChip';
 import { ThreadSkeleton } from './ListSkeleton';
 import { MessageItem } from './MessageItem';
@@ -76,6 +78,24 @@ export function initialExpanded(messages: readonly Message[]): Set<number> {
   return out;
 }
 
+/**
+ * Messages that became visible as sent / received mail since the last detail: ids never seen as
+ * non-drafts. A draft that is sent keeps its id (the row turns into the sent message), so ids are
+ * tracked as "seen as non-draft" — a draft id, or a message that went back to being a draft
+ * (undo send), counts as fresh once it shows up as mail. `seen` is updated in place.
+ */
+export function freshMessages(messages: readonly Message[], seen: Set<number>): Message[] {
+  const fresh: Message[] = [];
+  for (const m of messages) {
+    if (m.is_draft) seen.delete(m.id);
+    else if (!seen.has(m.id)) {
+      seen.add(m.id);
+      fresh.push(m);
+    }
+  }
+  return fresh;
+}
+
 const LEAVES_VIEW: ReadonlySet<ThreadAction> = new Set(['archive', 'trash', 'spam', 'not_spam', 'restore', 'delete_forever', 'unread']);
 const QUIET: ReadonlySet<ThreadAction> = new Set(['star', 'unstar', 'read', 'unread']);
 
@@ -104,7 +124,9 @@ export function ThreadView({ threadId, view, backLabel }: ThreadViewProps) {
   const [trustBusy, setTrustBusy] = useState(false);
   const [preview, setPreview] = useState<Attachment | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const knownIds = useRef<Set<number> | null>(null);
+  /** Ids seen as sent / received mail (not drafts); null until the first detail. */
+  const seenAsMail = useRef<Set<number> | null>(null);
+  const readWhenVisible = useRef(false);
   const markedRead = useRef(false);
   const openedDraft = useRef(false);
 
@@ -120,25 +142,43 @@ export function ThreadView({ threadId, view, backLabel }: ThreadViewProps) {
     useUiStore.getState().setCursor(threadId);
   }, [threadId]);
 
-  // Expansion: initial state once, then auto-expand newly arrived unread / newest messages.
+  // Expansion: initial state once, then auto-expand messages that newly appear as mail (arrived,
+  // or just sent from a draft of this thread) when unread or the newest one. A fresh unread
+  // message in this view is shown, so it is marked read (Gmail).
   useEffect(() => {
     if (!detail) return;
-    if (knownIds.current === null) {
-      knownIds.current = new Set(detail.messages.map((m) => m.id));
+    if (seenAsMail.current === null) {
+      seenAsMail.current = new Set();
+      freshMessages(detail.messages, seenAsMail.current);
       setExpanded(initialExpanded(visible));
       return;
     }
-    const known = knownIds.current;
-    const fresh = detail.messages.filter((m) => !known.has(m.id));
+    const fresh = freshMessages(detail.messages, seenAsMail.current);
     if (!fresh.length) return;
-    for (const m of fresh) known.add(m.id);
     const last = nonDraft[nonDraft.length - 1];
     setExpanded((prev) => {
       const next = new Set(prev);
-      for (const m of fresh) if (!m.is_draft && (!m.is_read || m.id === last?.id)) next.add(m.id);
+      for (const m of fresh) if (!m.is_read || m.id === last?.id) next.add(m.id);
       return next;
     });
-  }, [detail, visible, nonDraft]);
+    if (fresh.some((m) => !m.is_read && inViewScope(m, view.folder))) {
+      if (document.visibilityState === 'hidden') readWhenVisible.current = true;
+      else void performThreadAction(qc, { ids: [threadId], action: 'read' });
+    }
+  }, [detail, visible, nonDraft, qc, threadId, view.folder]);
+
+  // Mail that arrived while the tab was in the background is marked read when it is shown.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible' || !readWhenVisible.current) return;
+      readWhenVisible.current = false;
+      const d = qc.getQueryData<ThreadDetail>(queryKeys.thread(threadId));
+      if (d?.messages.some((m) => !m.is_draft && !m.is_read && inViewScope(m, view.folder)))
+        void performThreadAction(qc, { ids: [threadId], action: 'read' });
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [qc, threadId, view.folder]);
 
   // Opening a thread marks it read immediately.
   useEffect(() => {
@@ -284,7 +324,7 @@ export function ThreadView({ threadId, view, backLabel }: ThreadViewProps) {
     imagesShown.has(m.id) ||
     (!suspicious(m) && (m.direction === 'out' || me?.settings?.remote_images === 'always' || trusted.has(m.from.email.toLowerCase())));
   const onlyOne = nonDraft.length === 1;
-  const onMailto = (p: MailtoParts) => openNewMessage([...p.to, ...p.cc], p.subject);
+  const onMailto = (p: MailtoParts) => openMailto(p);
   const toggle = (id: number) =>
     setExpanded((prev) => {
       const next = new Set(prev);

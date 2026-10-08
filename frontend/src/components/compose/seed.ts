@@ -6,7 +6,7 @@ import type { Address, Attachment, Draft, DraftMode, Me, Message } from '@/api/t
 import { initialBodyHtml, inlineImageIds } from '@/lib/emailHtml';
 import { buildQuotedHtml, safeTimeZone } from '@/lib/quote';
 import { defaultFromIdentity, forwardSubject, mineMatcher, replyRecipients, replySubject } from '@/lib/recipients';
-import type { ComposeInit } from '@/stores/compose';
+import type { ComposeInit, ComposeUnsaved } from '@/stores/compose';
 
 export interface ComposeSeed {
   mode: DraftMode;
@@ -24,17 +24,25 @@ export interface ComposeSeed {
   html: string;
   quotedHtml: string | null;
   attachments: Attachment[];
+  /**
+   * Forward: the parent's regular attachments, shown until the first save copies them onto the
+   * draft (the window then adopts the server's copies from `Draft.attachments`).
+   */
+  inheritedAttachments: Attachment[];
   /** Inline attachments referenced by the initial body (see attachmentIdsForSave). */
   editorInlineIds: number[];
   /** Where the caret starts. */
   focus: 'to' | 'body-start' | 'body-end';
+  /** The values differ from the server's draft (restored unsaved edits): save them. */
+  dirty?: boolean;
 }
 
-function newBody(me: Me): string {
+function newBody(me: Me, text?: string): string {
   return initialBodyHtml({
     signatureHtml: me.settings.signature_html,
     signatureEnabled: me.settings.signature_enabled,
     filesOrigins: me.server.files_origins,
+    text,
   });
 }
 
@@ -46,6 +54,7 @@ export function seedFromInit(init: Exclude<ComposeInit, { kind: 'draft' }>, me: 
     bcc: [] as Address[],
     html: newBody(me),
     attachments: [] as Attachment[],
+    inheritedAttachments: [] as Attachment[],
     editorInlineIds: [] as number[],
   };
   if (init.kind === 'new') {
@@ -56,8 +65,10 @@ export function seedFromInit(init: Exclude<ComposeInit, { kind: 'draft' }>, me: 
       includeParentAttachments: false,
       fromAddressId: defaultFromIdentity(me.identities)?.address_id,
       to: init.to ? [...init.to] : [],
-      cc: [],
+      cc: init.cc ? [...init.cc] : [],
+      bcc: init.bcc ? [...init.bcc] : [],
       subject: init.subject ?? '',
+      html: newBody(me, init.body),
       quotedHtml: null,
       focus: init.to && init.to.length ? 'body-start' : 'to',
     };
@@ -91,6 +102,7 @@ export function seedFromInit(init: Exclude<ComposeInit, { kind: 'draft' }>, me: 
     cc: recipients.cc,
     subject: mode === 'forward' ? forwardSubject(parent.subject) : replySubject(parent.subject),
     quotedHtml: buildQuotedHtml(mode, parent, quoteOpts),
+    inheritedAttachments: mode === 'forward' ? parent.attachments.filter((a) => !a.inline) : [],
     focus: mode === 'forward' ? 'to' : 'body-start',
   };
 }
@@ -111,8 +123,30 @@ export function seedFromDraft(draft: Draft): ComposeSeed {
     html: draft.html || '<p></p>',
     quotedHtml: draft.quoted_html,
     attachments: [...draft.attachments],
+    inheritedAttachments: [],
     editorInlineIds: inlineImageIds(draft.html),
     focus: 'body-end',
+  };
+}
+
+/** A seed with a remounted form's unsaved edits on top (they are saved again right away). */
+export function withUnsaved(seed: ComposeSeed, unsaved: ComposeUnsaved | undefined): ComposeSeed {
+  if (!unsaved) return seed;
+  return {
+    ...seed,
+    fromAddressId: unsaved.fromAddressId ?? seed.fromAddressId,
+    to: [...unsaved.to],
+    cc: [...unsaved.cc],
+    bcc: [...unsaved.bcc],
+    subject: unsaved.subject,
+    html: unsaved.html,
+    quotedHtml: unsaved.quotedHtml,
+    attachments: [...unsaved.attachments],
+    // Copies of a forward's attachments are adopted from the server once the draft exists.
+    inheritedAttachments: seed.draftId === null ? seed.inheritedAttachments : [],
+    editorInlineIds: [...unsaved.editorInlineIds],
+    focus: 'body-end',
+    dirty: true,
   };
 }
 

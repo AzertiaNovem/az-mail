@@ -6,6 +6,7 @@ import type { QueryClient } from '@tanstack/react-query';
 import { getThread } from '@/api/endpoints';
 import { queryKeys, staleTimes } from '@/api/queryKeys';
 import type { Address, Message, ThreadDetail } from '@/api/types';
+import type { MailtoParts } from '@/lib/emailFrame';
 import { useComposeStore } from '@/stores/compose';
 
 export type ReplyKind = 'reply' | 'reply_all' | 'forward';
@@ -18,12 +19,29 @@ export function openDraft(draftId: number): string {
   return useComposeStore.getState().open({ kind: 'draft', draftId });
 }
 
-export function openNewMessage(to?: Address[], subject?: string): string {
+/** Extra fields of a new message (a mailto: link's cc / bcc / body). */
+export interface NewMessageExtras {
+  cc?: Address[];
+  bcc?: Address[];
+  /** Plain text. */
+  body?: string;
+}
+
+export function openNewMessage(to?: Address[], subject?: string, extras: NewMessageExtras = {}): string {
+  const { cc, bcc, body } = extras;
   return useComposeStore.getState().open({
     kind: 'new',
     ...(to && to.length ? { to } : {}),
+    ...(cc && cc.length ? { cc } : {}),
+    ...(bcc && bcc.length ? { bcc } : {}),
     ...(subject ? { subject } : {}),
+    ...(body && body.trim() ? { body } : {}),
   });
+}
+
+/** A mailto: link → a new message with its To / Cc / Bcc / subject / body (not Cc in To). */
+export function openMailto(parts: MailtoParts): string {
+  return openNewMessage(parts.to, parts.subject, { cc: parts.cc, bcc: parts.bcc, body: parts.body });
 }
 
 /** The newest draft of a thread that has drafts only (no sent/received messages), else null. */

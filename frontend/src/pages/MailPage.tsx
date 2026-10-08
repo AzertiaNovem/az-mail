@@ -3,7 +3,8 @@
  *
  *   /mail/:folder[/:threadId]          folder (validated against FOLDER_IDS)
  *   /mail/label/:labelId[/:threadId]   label (must exist once labels are loaded)
- *   /mail/search[/:threadId]?q=        search (empty q → inbox)
+ *   /mail/search[/:threadId]?q=        search (empty q → inbox; a thread link that lost its
+ *                                      query opens the thread under 所有邮件)
  *
  * The list stays mounted (hidden) while a thread is open, so returning keeps its scroll
  * position and the thread view knows its neighbours for j / k.
@@ -63,7 +64,11 @@ export function MailPage({ kind }: { kind: MailPageKind }) {
 
   useListTitle(threadId === null ? view : null, label?.name);
 
-  if (kind === 'search' && !q) return <Navigate to="/mail/inbox" replace />;
+  if (kind === 'search' && !q) {
+    // A search thread link without its query (copied without "?q=", truncated): still open it.
+    if (threadId !== null) return <Navigate to={`/mail/all/${threadId}`} replace />;
+    return <Navigate to="/mail/inbox" replace />;
+  }
   if (!view) return <NotFound embedded />;
   if (threadParam !== undefined && threadId === null) return <NotFound embedded />;
   if (kind === 'label' && labelsQuery.isSuccess && !label) return <NotFound embedded />;
