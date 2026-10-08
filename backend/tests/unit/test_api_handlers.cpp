@@ -10,6 +10,7 @@
 #include "core/crypto.hpp"
 #include "core/errors.hpp"
 #include "core/strings.hpp"
+#include "db/kv.hpp"
 #include "http/router.hpp"
 #include "http/throttle.hpp"
 #include "jobs/jobs.hpp"
@@ -231,14 +232,45 @@ TEST_CASE("login: failures", "[api][auth]") {
     CHECK(c.scalar<int64_t>("SELECT count(*) FROM sessions WHERE user_id=?", alice.id) == 1);  // only the seeded one
   });
 
-  // Disabled: 403 only with the right password (a wrong one stays 401, revealing nothing).
+  // Disabled (SEC-7): the same 403 whatever the password, so the answer never confirms a
+  // correct guess; every attempt is audited and counts against the throttle.
   api.ts.db.write([&](db::Tx& tx) {
     repo::UserPatch p;
     p.disabled = true;
     repo::update_user(tx, alice.id, p, api.ts.svc.now_ms());
   });
   CHECK_ERR(login(login_body("alice@team.example", kPassword)), 403u, "account_disabled");
-  CHECK_ERR(login(login_body("alice@team.example", "nope")), 401u, "invalid_credentials");
+  CHECK_ERR(login(login_body("alice@team.example", "nope")), 403u, "account_disabled");
+  api.ts.db.read([&](db::Conn& c) {
+    CHECK(c.scalar<int64_t>("SELECT count(*) FROM audit_log WHERE action='login.failure' AND actor_user_id=? "
+                            "AND detail_json LIKE '%disabled%'",
+                            alice.id) == 2);
+  });
+}
+
+TEST_CASE("login: attacker-sized or invalid emails are never tracked per email (SEC-2)", "[api][auth][sec]") {
+  Api api;
+  api.account("alice@team.example");
+  http::LoginThrottle throttle(http::LoginThrottle::Limits{5, 3, std::chrono::seconds(900), 4}, api.ts.clock);
+  api.ts.svc.login_throttle = &throttle;
+  auto login = [&](std::string body) { return api.call(api::auth_login, V::post, "/api/auth/login", std::move(body)); };
+
+  const std::string huge = std::string(100'000, 'a') + "@team.example";
+  CHECK_ERR(login(login_body(huge, "x")), 401u, "invalid_credentials");
+  CHECK_ERR(login(login_body("not an address", "x")), 401u, "invalid_credentials");
+  CHECK(throttle.email_keys() == 0);  // nothing attacker-sized kept
+  CHECK(throttle.ip_keys() == 1);     // but the client IP is counted
+  CHECK_ERR(login(login_body(huge + "2", "x")), 401u, "invalid_credentials");
+  CHECK_ERR(login(login_body("alice@team.example", kPassword)), 429u, "too_many_attempts");  // IP limit (3)
+  api.ts.db.read([&](db::Conn& c) {
+    CHECK(c.scalar<int64_t>("SELECT count(*) FROM audit_log WHERE detail_json LIKE '%invalid_email%'") == 3);
+    CHECK(c.scalar<int64_t>("SELECT max(length(target)) FROM audit_log WHERE action='login.failure'").value_or(0) <=
+          254);
+  });
+
+  // The login route accepts only small bodies (8 KiB) instead of the 1 MiB JSON limit.
+  for (const auto& r : api::route_table(api::route_limits_from(api.ts.cfg)))
+    if (r.pattern == "/api/auth/login") CHECK(r.body_limit == 8u << 10);
 }
 
 TEST_CASE("logout, me, unauthenticated calls", "[api][auth]") {
@@ -743,10 +775,30 @@ TEST_CASE("admin stats", "[api][admin]") {
   REQUIRE(r.status == 200u);
   const auto s = body_of(r).as_object();
   CHECK(s.at("users") == 1);
-  CHECK(s.at("queue") == json::parse(R"({"pending":0,"dead":0})"));
+  CHECK(s.at("queue") == json::parse(R"({"pending":0,"dead":0,"periodic":0})"));
+  CHECK(s.at("poll_gap").is_null());
   CHECK(s.at("storage") == json::parse(R"({"backend":"local","delivery":"redirect","blob_count":0,"blob_bytes":0})"));
   CHECK(s.at("quota_blocked") == false);
   CHECK(s.at("last_webhook_at").is_null());
+
+  // F4 (API.md Addendum B.1): periodic jobs counted apart, the poller's gap warning exposed.
+  const int64_t now = api.ts.svc.now_ms();
+  api.ts.db.write([&](db::Tx& tx) {
+    jobs::enqueue(tx, jobs::kinds::kPollReceiving, {},
+                  {.dedupe_key = jobs::dedupe_periodic(jobs::kinds::kPollReceiving), .now_ms = now});
+    jobs::enqueue(tx, jobs::kinds::kInboundFetch, {{"resend_id", "in_1"}}, {.now_ms = now});
+    db::kv_set(tx, db::kv_keys::kPollGapWarning, "发现 2 封早于上次同步位置但从未收到的邮件", now - 1000);
+  });
+  auto s2 = body_of(api.as(admin, api::admin_stats_get, V::get, "/api/admin/stats")).as_object();
+  CHECK(s2.at("queue") == json::parse(R"({"pending":2,"dead":0,"periodic":1})"));
+  CHECK(s2.at("poll_gap") == json::parse(R"({"detected_at":)" + std::to_string(now - 1000) +
+                                         R"(,"detail":"发现 2 封早于上次同步位置但从未收到的邮件"})"));
+  // Older than 7 days: no longer shown.
+  api.ts.db.write([&](db::Tx& tx) {
+    db::kv_set(tx, db::kv_keys::kPollGapWarning, "old", now - repo::kPollGapShowMs - 1);
+  });
+  s2 = body_of(api.as(admin, api::admin_stats_get, V::get, "/api/admin/stats")).as_object();
+  CHECK(s2.at("poll_gap").is_null());
 }
 
 // =============================================================================================

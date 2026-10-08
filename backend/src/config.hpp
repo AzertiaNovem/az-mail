@@ -115,6 +115,10 @@ struct Config {
   std::string resend_user_agent = "azmail/0.1.0";      // RESEND_USER_AGENT (required by Cloudflare)
   double resend_rate_rps = 8.0;                        // RESEND_RATE_RPS (team-wide limit is 10)
   int resend_timeout_sec = 30;                         // RESEND_TIMEOUT_SEC
+  // Additive (RT-4): assumed minimum upload rate to Resend in KiB/s. POST /emails gets an overall
+  // deadline of RESEND_TIMEOUT_SEC + body / rate (≤ 15 min); the idle limit per chunk stays
+  // RESEND_TIMEOUT_SEC. Lower it on links slower than ~2 Mbit/s.
+  int resend_upload_kbps = 256;                        // RESEND_UPLOAD_KBPS
   int webhook_tolerance_sec = 300;                     // AZMAIL_WEBHOOK_TOLERANCE_SEC (Svix)
 
   // ---- outbound HTTP client ---------------------------------------------------------------

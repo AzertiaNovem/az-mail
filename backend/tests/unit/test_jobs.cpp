@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <functional>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -46,6 +47,15 @@ int64_t count(test::TestServices& ts, std::string_view where) {
   return ts.db.read([&](db::Conn& c) {
     return c.scalar<int64_t>("SELECT COUNT(*) FROM jobs WHERE " + std::string(where)).value_or(0);
   });
+}
+
+bool eventually_true(const std::function<bool()>& pred, std::chrono::milliseconds timeout = 5s) {
+  const auto until = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < until) {
+    if (pred()) return true;
+    std::this_thread::sleep_for(5ms);
+  }
+  return pred();
 }
 
 RunnerConfig no_threads() {
@@ -444,4 +454,118 @@ TEST_CASE("jobs: many jobs across worker threads run exactly once", "[jobs]") {
   CHECK(count(ts, "state='done'") == 40);
   CHECK(seen.size() == 40);
   for (const auto& [id, n] : seen) CHECK(n == 1);
+}
+
+// ---- RT-7 / RT-8 / clock ----------------------------------------------------------------------------
+
+TEST_CASE("jobs: runner config keeps a short lease renewed by a heartbeat (RT-7/RT-8)", "[jobs]") {
+  const auto rc = runner_config_from(Config{});
+  CHECK(rc.lease == 2min);
+  CHECK(rc.heartbeat_every == 30s);
+  CHECK(rc.heartbeat_every < rc.lease);
+}
+
+TEST_CASE("jobs: cancel and reschedule stamp the caller's clock", "[jobs]") {
+  test::TestServices ts(1'000'000);  // a ManualClock far from the wall clock
+  const int64_t a = add(ts, kSend);
+  const int64_t b = add(ts, kSend, {}, {.dedupe_key = "b"});
+  ts.db.write([&](db::Tx& tx) {
+    CHECK(reschedule(tx, a, 5'000'000, ts.clock.now_ms() + 7));
+    CHECK(cancel(tx, b, ts.clock.now_ms() + 9));
+  });
+  ts.db.read([&](db::Conn& c) {
+    CHECK(c.scalar<int64_t>("SELECT updated_at FROM jobs WHERE id=?", a) == 1'000'007);
+    CHECK(c.scalar<int64_t>("SELECT run_at FROM jobs WHERE id=?", a) == 5'000'000);
+    CHECK(c.scalar<int64_t>("SELECT updated_at FROM jobs WHERE id=?", b) == 1'000'009);
+  });
+}
+
+TEST_CASE("jobs: request_stop + wait_idle let the owner bound the wait (RT-7)", "[jobs]") {
+  test::TestServices ts;
+  RunnerConfig rc;
+  rc.lane_threads = {{"inbound", 1}};
+  rc.stop_grace = 100ms;
+  std::atomic<int> started{0};
+  std::atomic<bool> release{false};
+  Runner r(ts.db, ts.svc, rc);
+  r.on(kFetch, "inbound", [&](Services&, const Job&, std::stop_token st) {
+    ++started;
+    while (!release.load()) std::this_thread::sleep_for(5ms);  // ignores its stop token
+    if (st.stop_requested()) throw Retry(1s, "shutdown", false);
+  });
+  const int64_t id = add(ts, kFetch);
+  r.start();
+  REQUIRE(eventually_true([&] { return started.load() == 1; }));
+  r.request_stop();
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK_FALSE(r.wait_idle(150ms));  // still running: returns after the timeout, not later
+  CHECK(std::chrono::steady_clock::now() - t0 < 1s);
+  release = true;
+  CHECK(r.wait_idle(3s));
+  r.stop();
+  CHECK(row(ts, id).state == "pending");
+  CHECK(row(ts, id).attempts == 0);  // the attempt was given back
+  // Stopped before start: start() is a no-op.
+  Runner r2(ts.db, ts.svc, rc);
+  r2.on(kFetch, "inbound", [](Services&, const Job&, std::stop_token) {});
+  r2.request_stop();
+  r2.start();
+  CHECK(r2.wait_idle(10ms));
+}
+
+TEST_CASE("jobs: the heartbeat keeps a live handler's lease past its expiry (RT-8)", "[jobs]") {
+  test::TestServices ts;
+  RunnerConfig rc;
+  rc.lane_threads = {{"inbound", 1}};
+  rc.lease = 300ms;
+  rc.heartbeat_every = 50ms;
+  rc.recover_every = 10ms;
+  std::atomic<int> runs{0};
+  std::atomic<bool> release{false};
+  Runner r(ts.db, ts.svc, rc);
+  r.on(kFetch, "inbound", [&](Services&, const Job&, std::stop_token) {
+    ++runs;
+    while (!release.load()) std::this_thread::sleep_for(5ms);
+  });
+  const int64_t id = add(ts, kFetch);
+  r.start();
+  REQUIRE(eventually_true([&] { return runs.load() == 1; }));
+  // Real time moves the ManualClock forward too, well past the original lease.
+  for (int i = 0; i < 10; ++i) {
+    std::this_thread::sleep_for(100ms);
+    ts.clock.advance(100);
+    (void)r.recover_expired();
+    CHECK(row(ts, id).state == "running");
+  }
+  release = true;
+  CHECK(eventually_true([&] { return row(ts, id).state == "done"; }));
+  r.stop();
+  CHECK(runs == 1);  // never re-claimed by recovery
+  CHECK(row(ts, id).attempts == 1);
+}
+
+TEST_CASE("jobs: on_abandoned runs for jobs given up by lease recovery (RT-8)", "[jobs]") {
+  test::TestServices ts;
+  const int64_t now = ts.clock.now_ms();
+  const int64_t gone = add(ts, kFetch, {{"resend_id", "in_1"}}, {.max_attempts = 2});
+  const int64_t back = add(ts, kFetch, {{"resend_id", "in_2"}}, {.dedupe_key = "x"});
+  ts.db.write([&](db::Tx& tx) {
+    tx.run("UPDATE jobs SET state='running', attempts=3, locked_until=? WHERE id=?", now - 1, gone);
+    tx.run("UPDATE jobs SET state='running', attempts=1, locked_until=? WHERE id=?", now - 1, back);
+  });
+  Runner r(ts.db, ts.svc, no_threads());
+  auto noop = [](Services&, const Job&, std::stop_token) {};
+  r.on(kFetch, "inbound", noop);
+  std::vector<std::pair<int64_t, std::string>> abandoned;
+  CHECK_THROWS_AS(r.on_abandoned(kSend, [](db::Tx&, const Job&, int64_t) {}), std::invalid_argument);  // no handler
+  r.on_abandoned(kFetch, [&](db::Tx&, const Job& j, int64_t t) {
+    CHECK(t == now);
+    CHECK(j.attempts == 3);
+    abandoned.emplace_back(j.id, std::string(j.payload.at("resend_id").as_string()));
+  });
+  CHECK_THROWS_AS(r.on_abandoned(kFetch, [](db::Tx&, const Job&, int64_t) {}), std::invalid_argument);  // duplicate
+  CHECK(r.recover_expired() == 2);
+  CHECK(abandoned == std::vector<std::pair<int64_t, std::string>>{{gone, "in_1"}});
+  CHECK(row(ts, gone).state == "dead");
+  CHECK(row(ts, back).state == "pending");
 }

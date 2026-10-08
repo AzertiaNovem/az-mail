@@ -1192,6 +1192,10 @@ AdminStats admin_stats(db::Conn& c, int64_t now_ms) {
   st.queue_pending =
       c.scalar<int64_t>("SELECT count(*) FROM jobs WHERE state IN ('pending','running')").value_or(0);
   st.queue_dead = c.scalar<int64_t>("SELECT count(*) FROM jobs WHERE state='dead'").value_or(0);
+  st.queue_periodic = c.scalar<int64_t>(
+                           "SELECT count(*) FROM jobs WHERE state IN ('pending','running') "
+                           "AND dedupe_key LIKE 'periodic:%'")
+                          .value_or(0);
   st.sent_24h =
       c.scalar<int64_t>("SELECT count(*) FROM outbound WHERE accepted_at>=?", since).value_or(0);
   st.received_24h = c.scalar<int64_t>(
@@ -1206,6 +1210,14 @@ AdminStats admin_stats(db::Conn& c, int64_t now_ms) {
   st.last_poll_at = db::kv_get_i64(c, db::kv_keys::kLastPollAt);
   const auto quota = db::kv_get(c, db::kv_keys::kQuotaBlocked);
   st.quota_blocked = quota.has_value() && !quota->empty();
+  {
+    auto s = c.prepare("SELECT value, updated_at FROM kv WHERE key=?");
+    s.bind_all(db::kv_keys::kPollGapWarning);
+    if (s.step() && !s.is_null(0)) {
+      PollGap g{s.i64(1), s.text(0)};
+      if (!trim(g.detail).empty() && g.detected_at >= now_ms - kPollGapShowMs) st.poll_gap = std::move(g);
+    }
+  }
   return st;
 }
 

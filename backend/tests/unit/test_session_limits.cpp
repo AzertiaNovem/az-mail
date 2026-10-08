@@ -764,3 +764,83 @@ TEST_CASE("server: start errors", "[session][server]") {
   add_basic_routes(s);
   CHECK_THROWS_AS(s.start(), std::system_error);
 }
+
+// ---- SEC-6: authentication before any JSON body is buffered ------------------------------------
+
+TEST_CASE("session: authenticated JSON routes reject anonymous clients before reading the body (SEC-6)",
+          "[session][server][sec]") {
+  TestServer s;
+  std::atomic<int> handled{0};
+  s.add(V::put, "/api/drafts/:id", [&](http::Ctx& ctx) {
+    ++handled;
+    return echo(ctx);
+  }, http::AuthReq::User, http::BodyMode::Json, 8u << 20);
+  s.add(V::post, "/api/admin/thing", echo, http::AuthReq::Admin, http::BodyMode::Json, 1u << 20);
+  s.resolver.add("tok-user", 7, 70);
+  s.start();
+  const std::string big_head = "PUT /api/drafts/1 HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n"
+                               "Content-Length: " + std::to_string((8u << 20) - 1) + "\r\n";
+  {
+    // No token: 401 right after the header, without waiting for (or buffering) 8 MiB.
+    RawClient c(s.port());
+    c.send(big_head + "\r\n" + std::string(1000, ' '));
+    auto r = c.read(3s);
+    CHECK(r.result_int() == 401);
+    CHECK(error_code_of(r) == "unauthorized");
+    CHECK_FALSE(r.keep_alive());
+    CHECK(RawClient::is_closed_error(c.wait_closed(3000ms)));
+  }
+  {
+    RawClient c(s.port());
+    c.send(big_head + "Authorization: Bearer wrong\r\n\r\n");
+    CHECK(c.read(3s).result_int() == 401);
+  }
+  {
+    // Admin route with a user token: 403 before the body.
+    RawClient c(s.port());
+    c.send("POST /api/admin/thing HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer tok-user\r\nContent-Type: "
+           "application/json\r\nContent-Length: 500000\r\n\r\n{");
+    auto r = c.read(3s);
+    CHECK(r.result_int() == 403);
+    CHECK(error_code_of(r) == "forbidden");
+  }
+  CHECK(handled == 0);
+  // With a valid token the body is read and the handler runs as before.
+  RawClient ok(s.port());
+  auto r = ok.request(
+      "PUT /api/drafts/1 HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer tok-user\r\nContent-Type: application/json\r\n"
+      "Content-Length: 11\r\n\r\n{\"a\":\"bcd\"}");
+  REQUIRE(r.result_int() == 200);
+  CHECK(json_of(r)["user_id"] == 7);
+  CHECK(json_of(r)["body"] == "{\"a\":\"bcd\"}");
+  CHECK(handled == 1);
+}
+
+// ---- RT-5: the end of the shutdown drain closes busy connections too ------------------------------
+
+TEST_CASE("server: close_all closes connections in the middle of a request (RT-5)", "[session][server]") {
+  TestServer s([](Config& c) {
+    c.header_timeout_sec = 60;
+    c.body_idle_timeout_sec = 60;
+  });
+  add_basic_routes(s);
+  s.start();
+  RawClient idle(s.port());
+  CHECK(idle.request(get("/api/echo")).result_int() == 200);
+  RawClient header(s.port());
+  header.send("GET /api/echo HTTP/1.1\r\nHost: t\r\n");  // header never finished
+  RawClient body(s.port());
+  body.send("POST /api/items HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{");
+  REQUIRE(eventually([&] { return s.server->connections() == 3; }));
+  std::this_thread::sleep_for(300ms);  // the server has read what was sent: two requests in progress
+  s.server->stop();  // closes only the idle one
+  CHECK(RawClient::is_closed_error(idle.wait_closed(3000ms)));
+  std::this_thread::sleep_for(200ms);
+  CHECK(s.server->connections() == 2);  // busy connections survive stop()
+  const auto t0 = std::chrono::steady_clock::now();
+  s.server->close_all();
+  CHECK(RawClient::is_closed_error(header.wait_closed(3000ms)));
+  CHECK(RawClient::is_closed_error(body.wait_closed(3000ms)));
+  CHECK(eventually([&] { return s.server->connections() == 0; }));
+  CHECK(std::chrono::steady_clock::now() - t0 < 2s);  // not the 60 s timeouts
+}

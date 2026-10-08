@@ -18,10 +18,13 @@ bool any_contains(const std::vector<std::string>& v, std::string_view needle) {
   return std::any_of(v.begin(), v.end(), [&](const std::string& s) { return s.find(needle) != std::string::npos; });
 }
 
+// 64 hex characters, like `openssl rand -hex 32`.
+constexpr std::string_view kStrongSecret = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
 // A Config that passes Serve validation.
 Config valid_serve_config() {
   Config c;
-  c.server_secret = std::string(test::kTestSecret);
+  c.server_secret = std::string(kStrongSecret);
   c.resend_api_key = "re_test_key";
   return c;
 }
@@ -315,4 +318,77 @@ TEST_CASE("config: warnings", "[config]") {
   c = valid_serve_config();
   c.resend_webhook_secret = "whsec_abc";
   CHECK(app::config_warnings(c).empty());
+}
+
+// ---- F2: placeholder and degenerate secrets ------------------------------------------------------
+
+TEST_CASE("config: placeholder secrets are rejected, generator output always accepted (F2)", "[config][sec]") {
+  // The unedited deploy/azmail.env.example values (current and previous wording).
+  for (std::string_view placeholder : {"CHANGE_ME_generate_with_openssl_rand_hex_32", "change-me-run-openssl-rand-hex-32",
+                                       "ChangeMe-please-0123456789abcdef0123456789"}) {
+    Config c = valid_serve_config();
+    c.server_secret = std::string(placeholder);
+    CHECK(any_contains(validate_config(c), "example placeholder"));
+    CHECK(app::server_secret_problem(placeholder).has_value());
+  }
+  // Through the env loader too (what serve and doctor read).
+  auto loaded = app::config_from_env({{"AZMAIL_SECRET", "CHANGE_ME_generate_with_openssl_rand_hex_32"},
+                                      {"RESEND_API_KEY", "re_x"}});
+  auto problems = loaded.problems;
+  for (auto& p : app::validate_config(loaded.cfg, app::ConfigPurpose::Serve)) problems.push_back(p);
+  CHECK(any_contains(problems, "example placeholder"));
+  CHECK_FALSE(any_contains(problems, "CHANGE_ME_generate"));  // never echoes the value
+
+  // Too short, and obviously degenerate values.
+  CHECK(any_contains(validate_config([] {
+          Config c = valid_serve_config();
+          c.server_secret = "0123456789abcdef0123456789abcde";  // 31 bytes
+          return c;
+        }()),
+        "too short"));
+  for (std::string bad : {std::string(64, 'a'), std::string("0123456789abcdef0123456789abcdef"),  // 2x one unit
+                          std::string("abababababababababababababababab"), std::string("abcdefg") + std::string(40, 'a')}) {
+    INFO(bad);
+    const auto problem = app::server_secret_problem(bad);
+    REQUIRE(problem.has_value());
+    CHECK(problem->find("not random") != std::string::npos);
+  }
+  CHECK_FALSE(app::server_secret_problem("1234567123456712345671234567xyzz").has_value());  // no full repetition
+
+  // Every `openssl rand -hex 32` / `secrets.token_hex(32)` / `openssl rand -base64 32` value passes.
+  for (int i = 0; i < 2000; ++i) {
+    const std::string hex = crypto::hex_encode(crypto::random_bytes(32));
+    const std::string b64 = crypto::b64_encode(crypto::random_bytes(32));
+    INFO(hex << " / " << b64);
+    REQUIRE_FALSE(app::server_secret_problem(hex).has_value());
+    REQUIRE_FALSE(app::server_secret_problem(b64).has_value());
+  }
+  // The value that broke the first version of this check: last character equal to the first.
+  CHECK_FALSE(app::server_secret_problem("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a09").has_value());
+  CHECK_FALSE(app::server_secret_problem("a" + crypto::hex_encode(crypto::random_bytes(31)) + "a").has_value());
+  // Decoded hex:/base64: secrets (raw bytes) too.
+  CHECK_FALSE(app::server_secret_problem(crypto::random_bytes(32)).has_value());
+}
+
+TEST_CASE("config: placeholder webhook secrets are rejected (F2)", "[config][sec]") {
+  Config c = valid_serve_config();
+  for (std::string_view bad : {"whsec_xxxxxxxxxxxxxxxxxxxxxxxx", "whsec_CHANGE_ME", "whsec_", "whsec_dGVzdA==",
+                               "whsec_not base64!!"}) {
+    INFO(bad);
+    c.resend_webhook_secret = std::string(bad);
+    CHECK(any_contains(validate_config(c), "RESEND_WEBHOOK_SECRET"));
+  }
+  for (int i = 0; i < 200; ++i) {
+    c.resend_webhook_secret = "whsec_" + crypto::b64_encode(crypto::random_bytes(24));
+    REQUIRE(validate_config(c).empty());
+  }
+  c.resend_webhook_secret = "whsec_" + crypto::b64_encode(std::string_view("azmail-mock-webhook-secret-01"));
+  CHECK(validate_config(c).empty());  // tools/mock_resend default
+}
+
+TEST_CASE("config: a shutdown grace above the systemd stop timeout is warned about (F6)", "[config]") {
+  Config c = valid_serve_config();
+  CHECK_FALSE(any_contains(app::config_warnings(c), "AZMAIL_SHUTDOWN_GRACE_SEC"));
+  c.shutdown_grace_sec = 60;
+  CHECK(any_contains(app::config_warnings(c), "AZMAIL_SHUTDOWN_GRACE_SEC"));
 }

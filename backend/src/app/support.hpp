@@ -29,7 +29,8 @@ bool r2_configured(const Config& cfg);
 std::size_t sweep_tmp_dir(const std::filesystem::path& dir, std::chrono::hours older_than);
 
 // Online backup with the SQLite backup API (DESIGN F3): copies `src` (a live WAL database is
-// fine) page by page into a temporary file next to `dest`, runs PRAGMA quick_check on the copy
+// fine) in a single backup step — one read snapshot, so concurrent writers neither block it nor
+// restart it (RT-9) — into a temporary file next to `dest`, runs PRAGMA quick_check on the copy
 // and renames it into place. Throws std::runtime_error when `dest` exists and !overwrite, or on
 // any SQLite/IO failure (the temporary file is removed). Returns the backup's size in bytes.
 std::uint64_t backup_database(const std::filesystem::path& src, const std::filesystem::path& dest,

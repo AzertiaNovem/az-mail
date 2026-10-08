@@ -46,15 +46,15 @@ int64_t enqueue(db::Tx& tx, std::string_view kind, boost::json::object payload, 
   return id;
 }
 
-bool cancel(db::Tx& tx, int64_t job_id) {
+bool cancel(db::Tx& tx, int64_t job_id, int64_t now_ms) {
   tx.run("UPDATE jobs SET state='canceled', updated_at=? WHERE id=? AND state='pending'",
-         azm::now_ms(), job_id);
+         now_ms > 0 ? now_ms : azm::now_ms(), job_id);
   return tx.changes() > 0;
 }
 
-bool reschedule(db::Tx& tx, int64_t job_id, int64_t run_at_ms) {
+bool reschedule(db::Tx& tx, int64_t job_id, int64_t run_at_ms, int64_t now_ms) {
   tx.run("UPDATE jobs SET run_at=?, updated_at=? WHERE id=? AND state='pending'", run_at_ms,
-         azm::now_ms(), job_id);
+         now_ms > 0 ? now_ms : azm::now_ms(), job_id);
   if (tx.changes() == 0) return false;
   tx.wake_jobs();
   return true;
@@ -128,6 +128,11 @@ RunnerConfig runner_config_from(const Config& cfg) {
                      {std::string(lanes::kSync), cfg.jobs_sync_threads},
                      {std::string(lanes::kMaintenance), cfg.jobs_maintenance_threads}};
   if (cfg.shutdown_grace_sec > 0) rc.stop_grace = std::chrono::seconds(cfg.shutdown_grace_sec);
+  // The heartbeat keeps the lease of every live handler (RT-8), so the lease only has to outlast
+  // a missed renewal or two: short, so a job interrupted by a crash or SIGKILL is retried about
+  // two minutes after the restart instead of five to ten (RT-7).
+  rc.lease = std::chrono::minutes(2);
+  rc.heartbeat_every = std::max<std::chrono::milliseconds>(rc.lease / 4, std::chrono::seconds(1));
   return rc;
 }
 
@@ -170,10 +175,22 @@ struct Runner::Impl {
   Services& svc;
   RunnerConfig cfg;
   std::map<std::string, Handler, std::less<>> handlers;
+  std::map<std::string, AbandonFn, std::less<>> abandon_hooks;
+
+  // Jobs whose handler is executing right now (lease heartbeat, RT-8).
+  struct Executing {
+    int attempts = 0;
+    std::chrono::steady_clock::time_point since;
+  };
+  std::mutex exec_mu;
+  std::map<int64_t, Executing> executing;  // job id -> claim (exec_mu)
+  std::thread heartbeat_thread;
+  bool heartbeat_stop = false;  // mu
 
   std::mutex mu;  // wake generation, lifecycle, worker count
   std::condition_variable cv;
   std::condition_variable exit_cv;
+  std::condition_variable heartbeat_cv;
   uint64_t wake_seq = 0;
   int active_workers = 0;
   bool started = false;
@@ -208,6 +225,38 @@ struct Runner::Impl {
     }
   }
 
+  // recover_expired_leases plus the on_abandoned hooks of the jobs it gives up, in `tx`.
+  int recover_in(db::Tx& tx, int64_t t) {
+    std::vector<Job> abandoned;
+    if (!abandon_hooks.empty()) {
+      // Exactly the rows recover_expired_leases is about to set 'dead'.
+      auto s = tx.prepare(
+          "SELECT id, kind, payload, attempts, max_attempts, lane, priority FROM jobs "
+          "WHERE state='running' AND locked_until IS NOT NULL AND locked_until<? AND attempts>max_attempts");
+      s.bind_all(t);
+      while (s.step()) {
+        Job j;
+        j.id = s.i64(0);
+        j.kind = s.text(1);
+        boost::system::error_code ec;
+        auto v = boost::json::parse(s.text(2), ec);
+        if (!ec && v.is_object()) j.payload = std::move(v.as_object());
+        j.attempts = static_cast<int>(s.i64(3));
+        j.max_attempts = static_cast<int>(s.i64(4));
+        j.lane = s.text(5);
+        j.priority = static_cast<int>(s.i64(6));
+        if (abandon_hooks.count(j.kind)) abandoned.push_back(std::move(j));
+      }
+    }
+    const int n = recover_expired_leases(tx, t);
+    for (const auto& j : abandoned) {
+      log::warn("job given up after repeated lease expiry",
+                {{"job_id", j.id}, {"kind", j.kind}, {"attempts", j.attempts}});
+      abandon_hooks.find(j.kind)->second(tx, j, t);
+    }
+    return n;
+  }
+
   void recover(bool force) {
     std::unique_lock lk(recover_mu, std::try_to_lock);
     if (!lk.owns_lock()) return;
@@ -217,13 +266,44 @@ struct Runner::Impl {
     try {
       const int64_t t = now();
       const int n = pool.write([&](db::Tx& tx) {
-        const int r = recover_expired_leases(tx, t);
+        const int r = recover_in(tx, t);
         ensure_periodic(tx, t);
         return r;
       });
       if (n > 0) log::warn("recovered jobs with expired leases", {{"count", n}});
     } catch (const std::exception& e) {
       log::error("job lease recovery failed", {{"error", e.what()}});
+    }
+  }
+
+  // Renews the lease of every job a worker of this process is executing (RT-8).
+  void renew_leases() {
+    std::vector<std::pair<int64_t, int>> live;
+    {
+      const auto steady = std::chrono::steady_clock::now();
+      std::lock_guard lk(exec_mu);
+      for (const auto& [id, e] : executing)
+        if (steady - e.since < cfg.max_heartbeat) live.emplace_back(id, e.attempts);
+    }
+    if (live.empty()) return;
+    try {
+      const int64_t until = now() + std::max<int64_t>(1, cfg.lease.count());
+      pool.write([&](db::Tx& tx) {
+        for (const auto& [id, attempts] : live) (void)extend_lease(tx, id, attempts, until);
+      });
+    } catch (const std::exception& e) {
+      log::warn("job lease renewal failed", {{"error", e.what()}});
+    }
+  }
+
+  void heartbeat() {
+    std::unique_lock lk(mu);
+    while (!heartbeat_stop) {
+      heartbeat_cv.wait_for(lk, cfg.heartbeat_every, [&] { return heartbeat_stop; });
+      if (heartbeat_stop) break;
+      lk.unlock();
+      renew_leases();
+      lk.lock();
     }
   }
 
@@ -266,6 +346,20 @@ struct Runner::Impl {
 
   Outcome execute(const Handler& h, const Job& job, std::stop_token st) {
     resend::ScopedStopToken scoped(st);  // Resend calls blocked in the rate limiter end on stop
+    struct ExecutingGuard {
+      Impl& m;
+      int64_t id;
+      ExecutingGuard(Impl& impl, const Job& j) : m(impl), id(j.id) {
+        std::lock_guard lk(m.exec_mu);
+        m.executing[id] = Executing{j.attempts, std::chrono::steady_clock::now()};
+      }
+      ~ExecutingGuard() {
+        std::lock_guard lk(m.exec_mu);
+        m.executing.erase(id);
+      }
+      ExecutingGuard(const ExecutingGuard&) = delete;
+      ExecutingGuard& operator=(const ExecutingGuard&) = delete;
+    } executing_guard(*this, job);
     Outcome out;
     try {
       h.fn(svc, job, st);
@@ -417,11 +511,21 @@ void Runner::on(std::string kind, std::string lane, JobFn fn, std::optional<std:
   impl_->handlers.emplace(std::move(kind), Impl::Handler{std::move(lane), std::move(fn), periodic});
 }
 
+void Runner::on_abandoned(std::string kind, AbandonFn fn) {
+  if (!fn) throw std::invalid_argument("Runner::on_abandoned: empty hook for " + kind);
+  std::lock_guard lk(impl_->mu);
+  if (impl_->started) throw std::logic_error("Runner::on_abandoned: register hooks before start()");
+  if (!impl_->handlers.count(kind)) throw std::invalid_argument("Runner::on_abandoned: no handler for kind " + kind);
+  if (impl_->abandon_hooks.count(kind))
+    throw std::invalid_argument("Runner::on_abandoned: duplicate hook for " + kind);
+  impl_->abandon_hooks.emplace(std::move(kind), std::move(fn));
+}
+
 void Runner::start() {
   Impl& m = *impl_;
   {
     std::lock_guard lk(m.mu);
-    if (m.started || m.stopped) return;
+    if (m.started || m.stopped || m.stop_src.stop_requested()) return;
     m.started = true;
   }
   m.recover(true);  // crash recovery + periodic seeds before any worker runs
@@ -442,7 +546,22 @@ void Runner::start() {
       });
     }
   }
+  if (!m.threads.empty() && m.cfg.heartbeat_every.count() > 0)
+    m.heartbeat_thread = std::thread([&m] { m.heartbeat(); });
   log::info("job runner started", {{"threads", static_cast<int64_t>(m.threads.size())}});
+}
+
+void Runner::request_stop() {
+  Impl& m = *impl_;
+  m.stop_src.request_stop();
+  std::lock_guard lk(m.mu);
+  m.cv.notify_all();
+}
+
+bool Runner::wait_idle(std::chrono::milliseconds timeout) {
+  Impl& m = *impl_;
+  std::unique_lock lk(m.mu);
+  return m.exit_cv.wait_for(lk, timeout, [&] { return m.active_workers == 0; });
 }
 
 void Runner::stop() {
@@ -452,18 +571,28 @@ void Runner::stop() {
     if (m.stopped) return;
     m.stopped = true;
   }
-  m.stop_src.request_stop();
-  {
-    std::unique_lock lk(m.mu);
-    m.cv.notify_all();
-    const bool drained = m.exit_cv.wait_for(lk, m.cfg.stop_grace, [&] { return m.active_workers == 0; });
-    if (!drained)
-      log::warn("job handlers still running after the stop grace period; waiting for them",
-                {{"running", m.active_workers}});
+  request_stop();
+  if (!wait_idle(m.cfg.stop_grace)) {
+    std::lock_guard lk(m.mu);
+    log::warn("job handlers still running after the stop grace period; waiting for them",
+              {{"running", m.active_workers}});
   }
   for (auto& t : m.threads)
     if (t.joinable()) t.join();
   m.threads.clear();
+  {
+    std::lock_guard lk(m.mu);
+    m.heartbeat_stop = true;
+  }
+  m.heartbeat_cv.notify_all();
+  if (m.heartbeat_thread.joinable()) m.heartbeat_thread.join();
+}
+
+int Runner::recover_expired() {
+  Impl& m = *impl_;
+  std::lock_guard lk(m.recover_mu);
+  const int64_t t = m.now();
+  return m.pool.write([&](db::Tx& tx) { return m.recover_in(tx, t); });
 }
 
 void Runner::wake() {

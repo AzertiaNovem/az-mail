@@ -11,8 +11,11 @@
 #include "jobs/kinds.hpp"
 #include "mail/eml.hpp"
 #include "mail/inbound.hpp"
+#include "repo/accounts.hpp"
 #include "resend/client.hpp"
 #include "services.hpp"
+
+#include <algorithm>
 
 #include <system_error>
 #include <unordered_set>
@@ -26,9 +29,12 @@ using resend::Error;
 
 // B7: GET receiving/{id} may 404 right after the webhook — retry 5 times over ~10 minutes.
 constexpr std::chrono::milliseconds kNotFoundDelays[] = {30s, 1min, 2min, 3min, 4min};
-constexpr int64_t kTransferLeaseMs = 10 * 60 * 1000;  // renewed before every download
+// Renewed before every download and before storing; the Runner's heartbeat renews it during a
+// transfer (RT-8), so it only bridges a missed heartbeat.
+constexpr int64_t kTransferLeaseMs = 5 * 60 * 1000;
 constexpr int kPollPageSize = 100;
 constexpr int kPollMaxPages = 20;  // B8
+constexpr int64_t kPollGapShowMs = repo::kPollGapShowMs;  // a gap warning is kept this long (F4)
 
 std::chrono::milliseconds retry_after(const Error& e) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(e.retry_after.value_or(std::chrono::seconds(1)));
@@ -177,6 +183,17 @@ class FetchAttempt {
     } catch (const Error& e) {
       if (e.kind != Error::Kind::NotFound) map_error(e, "list_received_attachments");
     }
+    // The listing must cover every part get_received announced (RT-2): delivering a partial set
+    // would mark the row delivered and the missing parts could never be fetched again. Retried;
+    // the last attempt delivers what there is rather than nothing.
+    if (const std::size_t missing = missing_parts(rcv.attachments, listed); missing > 0) {
+      log::warn("attachment listing incomplete", {{"resend_id", id_},
+                                                  {"announced", static_cast<int64_t>(rcv.attachments.size())},
+                                                  {"listed", static_cast<int64_t>(listed.size())},
+                                                  {"missing", static_cast<int64_t>(missing)}});
+      if (job_.attempts < job_.max_attempts)
+        throw Retry(std::chrono::milliseconds(0), "attachment listing incomplete (" + std::to_string(missing) + " missing)");
+    }
     struct Downloaded {
       const resend::RecvAttachment* meta;
       fs::path path;
@@ -194,7 +211,9 @@ class FetchAttempt {
         files.push_back({&att, tmp, dl->sha256});
     }
 
-    // 4. Store blobs and deliver, under one writer guard held until COMMIT.
+    // 4. Store blobs and deliver, under one writer guard held until COMMIT — only while this
+    //    worker still owns the job (RT-8): a re-claimed job is delivered by its new owner.
+    ensure_lease();
     try {
       auto guard = blob_writer_guard();
       std::optional<BlobRef> raw_ref;
@@ -235,6 +254,22 @@ class FetchAttempt {
   static std::optional<std::string> sha_or_none(const std::string& s) {
     if (is_sha256_hex(s)) return s;
     return std::nullopt;
+  }
+
+  // Parts announced by get_received but absent from the listing: by id when the announcement
+  // carries ids, else by count.
+  static std::size_t missing_parts(const std::vector<resend::RecvAttachment>& announced,
+                                   const std::vector<resend::RecvAttachment>& listed) {
+    std::unordered_set<std::string> have;
+    for (const auto& a : listed)
+      if (!a.id.empty()) have.insert(a.id);
+    std::size_t missing = 0, anonymous = 0;
+    for (const auto& a : announced) {
+      if (a.id.empty()) ++anonymous;
+      else if (!have.count(a.id)) ++missing;
+    }
+    if (anonymous > 0 && announced.size() > listed.size()) missing = std::max(missing, announced.size() - listed.size());
+    return missing;
   }
 
   // Renews the lease before a long transfer; a lost lease means another worker owns the job.
@@ -278,7 +313,7 @@ class FetchAttempt {
 
 }  // namespace
 
-void run_inbound_fetch(Services& svc, const Job& job, std::stop_token) {
+void run_inbound_fetch(Services& svc, const Job& job, std::stop_token st) {
   std::string resend_id;
   if (auto it = job.payload.find(payload::kResendId); it != job.payload.end() && it->value().is_string())
     resend_id = std::string(it->value().as_string());
@@ -299,11 +334,15 @@ void run_inbound_fetch(Services& svc, const Job& job, std::stop_token) {
   try {
     attempt.run();
   } catch (const Retry& r) {
+    // A failure while the process shuts down (aborted transfers, RT-7) is not the mail's fault:
+    // the attempt is given back and nothing is marked failed.
+    if (r.count_attempt && st.stop_requested()) throw Retry(1s, "shutdown: " + r.reason, false);
     if (r.count_attempt && last) record_last(r.reason);
     throw;
   } catch (const Permanent&) {
     throw;
   } catch (const std::exception& e) {
+    if (st.stop_requested()) throw Retry(1s, std::string("shutdown: ") + e.what(), false);
     if (last) record_last(e.what());
     throw;
   }
@@ -365,12 +404,12 @@ void run_poll_receiving(Services& svc, const Job&, std::stop_token st) {
   }
 
   const int64_t now = svc.now_ms();
+  // The kv row's updated_at is the detection time (AdminStats.poll_gap.detected_at, F4).
   std::optional<std::string> warning;
   if (gap > 0) {
-    warning = iso8601_utc(now) + " 发现 " + std::to_string(gap) + " 封早于上次同步位置但从未收到的邮件（已补收）";
+    warning = "发现 " + std::to_string(gap) + " 封早于上次同步位置但从未收到的邮件（已补收），请检查 webhook 投递";
   } else if (high_water && !found_known && !unknown.empty() && (page_limit || end_reached)) {
-    warning = iso8601_utc(now) +
-              " 未找到上次同步位置（可能超过 Resend 30 天保留期或超过 20 页），期间的邮件可能已丢失";
+    warning = "未找到上次同步位置（可能超过 Resend 30 天保留期或超过 20 页），期间的邮件可能已丢失";
   }
   svc.db.write([&](db::Tx& tx) {
     for (const auto& id : unknown) {
@@ -380,17 +419,37 @@ void run_poll_receiving(Services& svc, const Job&, std::stop_token st) {
     }
     db::kv_set_i64(tx, db::kv_keys::kLastPollAt, now, now);
     if (newest) db::kv_set(tx, db::kv_keys::kPollHighWater, *newest, now);
-    if (warning) db::kv_set(tx, db::kv_keys::kPollGapWarning, *warning, now);
+    if (warning) {
+      db::kv_set(tx, db::kv_keys::kPollGapWarning, *warning, now);
+    } else if (auto at = tx.scalar<int64_t>("SELECT updated_at FROM kv WHERE key=?", db::kv_keys::kPollGapWarning);
+               at && *at < now - kPollGapShowMs) {
+      db::kv_delete(tx, db::kv_keys::kPollGapWarning);  // aged out (admin stats stop showing it too)
+    }
   });
   if (!unknown.empty()) log::info("poll found new inbound mail", {{"count", static_cast<int64_t>(unknown.size())}});
   if (warning) log::warn("poll gap detected", {{"gap", gap}});
 }
 
+void abandon_inbound_fetch(db::Tx& tx, const Job& job, int64_t now_ms) {
+  auto it = job.payload.find(payload::kResendId);
+  if (it == job.payload.end() || !it->value().is_string() || it->value().as_string().empty()) return;
+  const std::string resend_id(it->value().as_string());
+  if (const auto st = mail::inbound_state(tx.conn(), resend_id); !st || *st != mail::InboundState::Pending) return;
+  mail::mark_inbound_failed(tx, resend_id,
+                            "gave up after " + std::to_string(job.attempts) +
+                                " attempts: lease expired repeatedly (worker stopped or stalled)",
+                            now_ms);
+}
+
 void register_inbound_jobs(Runner& runner) {
   const Config& cfg = runner.services().cfg;
   runner.on(std::string(kinds::kInboundFetch), std::string(lanes::kInbound), run_inbound_fetch);
+  // A fetch whose lease expired on its last attempt is given up by lease recovery, without the
+  // handler's own last-attempt bookkeeping: record the domain failure there (RT-8).
+  runner.on_abandoned(std::string(kinds::kInboundFetch), abandon_inbound_fetch);
+  // cfg.poll_interval_sec as configured (validated >= 5 s); no silent floor.
   runner.on(std::string(kinds::kPollReceiving), std::string(lanes::kSync), run_poll_receiving,
-            std::chrono::seconds(std::max(10, cfg.poll_interval_sec)));
+            std::chrono::seconds(std::max(1, cfg.poll_interval_sec)));
 }
 
 }  // namespace azm::jobs

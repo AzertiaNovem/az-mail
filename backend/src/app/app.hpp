@@ -29,6 +29,7 @@
 
 #include "config.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 
@@ -37,6 +38,22 @@ struct Services;
 }
 
 namespace azm::app {
+
+// Additive (RT-5/RT-7/F6): time budget of a graceful shutdown, all from its start.
+// AZMAIL_SHUTDOWN_GRACE_SEC is the TOTAL (default 25 s; systemd TimeoutStopSec must exceed it):
+//  * drain       — in-flight requests finish (min(5 s, total/4)), then every remaining connection
+//                  is closed;
+//  * abort_at    — job handlers run until then (stop token set from the start); then every
+//                  outbound HTTP transfer still in flight is aborted (net::CancelSignal);
+//  * after_abort — clamp(total/5, 0.5 s, 5 s) for handlers to record their outcome, the pools
+//                  to finish and the io threads to stop.
+struct ShutdownBudget {
+  std::chrono::milliseconds total{0};
+  std::chrono::milliseconds drain{0};
+  std::chrono::milliseconds abort_at{0};
+  std::chrono::milliseconds after_abort{0};
+};
+ShutdownBudget shutdown_budget(int shutdown_grace_sec);
 
 class App {
  public:
@@ -48,10 +65,14 @@ class App {
   // Wires everything and starts serving. Throws std::runtime_error with an actionable message
   // (no secrets) on any failure (invalid config, DB capability, R2 probe, bind).
   void start();
-  // Graceful shutdown: close the acceptor, Hub::close_all (going_away), Runner::stop (≤
-  // cfg.shutdown_grace_sec), join the blocking pools, stop the io_context. Idempotent.
+  // Graceful shutdown within shutdown_budget(cfg.shutdown_grace_sec).total: close the acceptor,
+  // Hub::close_all (going_away), Runner::request_stop; drain connections, then close the rest;
+  // wait for job handlers, then abort outbound HTTP; Runner::stop; stop and join the io threads;
+  // join and destroy the blocking pools; destroy the server and the io_context. Idempotent.
   void stop();
   // start(); block until SIGINT/SIGTERM (asio::signal_set); stop(). Returns the exit code.
+  // Additive (F6/RT-7): should stop() overrun shutdown_budget(...).total, the process exits
+  // at once with code 1 (logged) instead of waiting for systemd's SIGKILL.
   int run();
 
   uint16_t port() const;      // bound HTTP port (after start)

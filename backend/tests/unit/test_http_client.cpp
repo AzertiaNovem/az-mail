@@ -513,3 +513,85 @@ TEST_CASE("http client: options from Config", "[http_client]") {
   CHECK(o.allow_insecure_http);
   CHECK(o.read_timeout == 12s);
 }
+
+// ---- RT-1: HEAD of a large object --------------------------------------------------------------
+
+TEST_CASE("http client: HEAD of an object over max_body is not TooLarge (RT-1)", "[http_client]") {
+  FakeHttpServer srv([](const FakeRequest&) { return FakeResponse::text(200, std::string(200000, 'h')); });
+  HttpClient client(insecure_opts());
+  auto head = get(srv.base_url() + "/obj");
+  head.method = bhttp::verb::head;
+  head.max_body = 64u << 10;  // R2BlobStore's error-body limit, smaller than the object
+  const auto r = client.send(head);
+  CHECK(r.status == 200);
+  CHECK(r.body.empty());
+  CHECK(r.body_size == 0);
+  CHECK(r.header("content-length") == std::optional<std::string>("200000"));
+  // A GET of the same object still enforces the limit.
+  auto g = get(srv.base_url() + "/obj");
+  g.max_body = 64u << 10;
+  CHECK(kind_of(client, g) == NetError::Kind::TooLarge);
+}
+
+// ---- RT-7: shutdown abort ---------------------------------------------------------------------
+
+TEST_CASE("http client: CancelSignal aborts sends in flight and fails later ones fast (RT-7)",
+          "[http_client][timeout]") {
+  FakeHttpServer srv([](const FakeRequest& req) {
+    if (req.path == "/stall") {
+      auto r = FakeResponse::text(200, "late");
+      r.delay_before_headers = 20s;
+      return r;
+    }
+    if (req.path == "/partial") {
+      auto r = FakeResponse::text(200, std::string(100000, 'p'));
+      r.partial_bytes = 1000;
+      r.stall_after_partial = 20s;
+      return r;
+    }
+    return FakeResponse::text(200, "ok");
+  });
+  auto opts = insecure_opts();
+  opts.read_timeout = 30s;
+  auto cancel = std::make_shared<CancelSignal>();
+  opts.cancel = cancel;
+  HttpClient client(opts);
+  CHECK(client.send(get(srv.base_url() + "/ok")).status == 200);
+  CHECK_FALSE(client.cancelled());
+
+  test::TempDir td;
+  const auto sink = td / "download.bin";
+  std::atomic<int> aborted{0};
+  auto run = [&](HttpRequest r) {
+    r.timeout = 60s;
+    try {
+      (void)client.send(r);
+    } catch (const NetError& e) {
+      if (e.kind == NetError::Kind::Aborted) ++aborted;
+    }
+  };
+  HttpRequest partial = get(srv.base_url() + "/partial");
+  partial.sink = sink;
+  const auto t0 = std::chrono::steady_clock::now();
+  std::thread a(run, get(srv.base_url() + "/stall"));
+  std::thread b(run, partial);
+  for (int i = 0; i < 500 && srv.request_count() < 3; ++i) std::this_thread::sleep_for(10ms);
+  REQUIRE(srv.request_count() == 3);  // both are waiting on the server now
+  std::this_thread::sleep_for(100ms);
+  cancel->cancel();
+  a.join();
+  b.join();
+  CHECK(aborted == 2);
+  CHECK(std::chrono::steady_clock::now() - t0 < 5s);  // not the 20 s stalls nor the 60 s deadline
+  CHECK_FALSE(std::filesystem::exists(sink));          // the partial download is removed
+  CHECK(client.cancelled());
+
+  // Later sends fail before connecting.
+  CHECK(kind_of(client, get(srv.base_url() + "/ok")) == NetError::Kind::Aborted);
+  CHECK(srv.request_count() == 3);
+  CHECK(NetError(NetError::Kind::Aborted, "x").retryable());
+  // A client without the signal is unaffected.
+  HttpClient other(insecure_opts());
+  CHECK(other.send(get(srv.base_url() + "/ok")).status == 200);
+  CHECK_FALSE(other.cancelled());
+}

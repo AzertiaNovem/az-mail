@@ -14,6 +14,7 @@
 #include <boost/json/value.hpp>
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace azm::resend {
 namespace {
@@ -24,6 +25,12 @@ namespace json = boost::json;
 constexpr std::size_t kMaxJsonResponse = 64u << 20;  // received mail bodies can be large
 constexpr std::chrono::minutes kDownloadTimeout{15};
 constexpr int kDownloadRedirects = 5;
+constexpr int kAttachmentPageSize = 100;  // Resend's maximum page size (default 20)
+constexpr int kMaxAttachmentPages = 20;   // 2000 parts at most
+// POST /emails carries up to ~37 MB of base64 attachments: its overall deadline grows with the
+// body (RT-4) at the assumed minimum upload rate, capped; the per-chunk idle limit
+// (ClientOptions::read_timeout = RESEND_TIMEOUT_SEC) still ends a stalled connection fast.
+constexpr std::chrono::minutes kMaxSendTimeout{15};
 
 std::string enc(std::string_view id) { return url_encode(id); }
 
@@ -166,11 +173,21 @@ DomainInfo parse_domain(const json::object& d) {
 
 }  // namespace
 
+std::chrono::milliseconds send_timeout(std::chrono::milliseconds base, std::size_t body_bytes,
+                                       std::uint64_t bytes_per_sec) {
+  if (bytes_per_sec == 0) bytes_per_sec = 1;
+  const auto upload = std::chrono::milliseconds(static_cast<int64_t>(
+      (static_cast<std::uint64_t>(body_bytes) * 1000 + bytes_per_sec - 1) / bytes_per_sec));
+  const auto cap = std::max<std::chrono::milliseconds>(base, kMaxSendTimeout);
+  return std::min<std::chrono::milliseconds>(base + upload, cap);
+}
+
 struct Client::Impl {
   std::string base;  // no trailing '/'
   std::string api_key;
   std::string user_agent;
   std::chrono::milliseconds timeout{30000};
+  std::uint64_t upload_bytes_per_sec = 256u << 10;  // cfg.resend_upload_kbps KiB/s
   net::HttpClient* http = nullptr;
   RateLimiter* limiter = nullptr;
 
@@ -180,12 +197,17 @@ struct Client::Impl {
   }
 
   [[noreturn]] static void network_error(const net::NetError& e) {
+    // A shutdown abort (RT-7) reads like a stopped rate limiter: jobs give the attempt back.
+    if (e.kind == net::NetError::Kind::Aborted) throw Error(Error::Kind::Network, 0, "stopped", e.what());
     throw Error(Error::Kind::Network, 0, "network", e.what());
   }
 
   // One API call: rate-limiter token, auth headers, error mapping. Returns a 2xx response.
+  // `scale_timeout`: the overall deadline also covers uploading the body at upload_bytes_per_sec
+  // (POST /emails, RT-4); otherwise it is RESEND_TIMEOUT_SEC.
   net::HttpResponse call(bhttp::verb method, const std::string& path, const json::object* body,
-                         Priority prio, std::vector<std::pair<std::string, std::string>> extra = {}) {
+                         Priority prio, std::vector<std::pair<std::string, std::string>> extra = {},
+                         bool scale_timeout = false) {
     if (!limiter->acquire(prio, current_stop_token()))
       throw Error(Error::Kind::Network, 0, "stopped", "shutdown requested");
     net::HttpRequest req;
@@ -199,6 +221,12 @@ struct Client::Impl {
     if (body != nullptr) {
       req.headers.emplace_back("Content-Type", "application/json");
       req.body = json::serialize(*body);
+    }
+    if (scale_timeout) {
+      req.timeout = send_timeout(timeout, req.body.size(), upload_bytes_per_sec);
+      // What is still in the socket's send buffer when the last write returns drains at the
+      // link's pace before Resend can answer: the header wait gets the whole (scaled) budget.
+      if (req.timeout > timeout) req.response_timeout = req.timeout;
     }
     for (auto& h : extra) req.headers.push_back(std::move(h));
     net::HttpResponse resp;
@@ -254,6 +282,7 @@ Client::Client(const Config& cfg, net::HttpClient& http, RateLimiter& limiter)
   impl_->user_agent = cfg.resend_user_agent.empty() ? std::string("azmail") : cfg.resend_user_agent;
 #endif
   if (cfg.resend_timeout_sec > 0) impl_->timeout = std::chrono::seconds(cfg.resend_timeout_sec);
+  if (cfg.resend_upload_kbps > 0) impl_->upload_bytes_per_sec = static_cast<std::uint64_t>(cfg.resend_upload_kbps) << 10;
   impl_->http = &http;
   impl_->limiter = &limiter;
 }
@@ -304,7 +333,7 @@ std::string Client::send(const SendRequest& r) {
   if (r.scheduled_at_iso) o["scheduled_at"] = *r.scheduled_at_iso;
   std::vector<std::pair<std::string, std::string>> extra;
   if (!r.idempotency_key.empty()) extra.emplace_back("Idempotency-Key", r.idempotency_key);
-  const auto resp = impl_->call(bhttp::verb::post, "/emails", &o, Priority::High, std::move(extra));
+  const auto resp = impl_->call(bhttp::verb::post, "/emails", &o, Priority::High, std::move(extra), true);
   const json::object body = Impl::parse_object(resp);
   auto id = str_field(body, "id");
   if (!id || id->empty())
@@ -428,16 +457,41 @@ ReceivedPage Client::list_received(int limit, std::optional<std::string> after,
 
 std::vector<RecvAttachment> Client::list_received_attachments(std::string_view id) {
   impl_->require("list_received_attachments");
-  const auto resp =
-      impl_->call(bhttp::verb::get, "/emails/receiving/" + enc(id) + "/attachments", nullptr, Priority::Normal);
-  const json::value v = Impl::parse_body(resp);
+  // Cursor-paginated like every Resend list (default limit 20, max 100): follow has_more with
+  // after=<last id> so mail with more parts than one page keeps all of them (RT-2). Bounded, and
+  // a page that adds nothing new (cursor not advancing) ends the walk.
   std::vector<RecvAttachment> out;
-  const auto* data = list_data(v);
-  if (data == nullptr)
-    throw Error(Error::Kind::Server, static_cast<int>(resp.status), "invalid_response",
-                "attachments response has no data");
-  for (const auto& a : *data)
-    if (a.is_object()) out.push_back(parse_attachment(a.as_object()));
+  std::unordered_set<std::string> seen;
+  std::optional<std::string> after;
+  for (int page = 0; page < kMaxAttachmentPages; ++page) {
+    std::string path = "/emails/receiving/" + enc(id) + "/attachments?limit=" + std::to_string(kAttachmentPageSize);
+    if (after) path += "&after=" + enc(*after);
+    const auto resp = impl_->call(bhttp::verb::get, path, nullptr, Priority::Normal);
+    const json::value v = Impl::parse_body(resp);
+    const auto* data = list_data(v);
+    if (data == nullptr)
+      throw Error(Error::Kind::Server, static_cast<int>(resp.status), "invalid_response",
+                  "attachments response has no data");
+    std::optional<std::string> last;
+    bool added = false;
+    for (const auto& a : *data) {
+      if (!a.is_object()) continue;
+      RecvAttachment att = parse_attachment(a.as_object());
+      if (!att.id.empty()) {
+        last = att.id;
+        if (!seen.insert(att.id).second) continue;  // repeated by an overlapping page
+      }
+      added = true;
+      out.push_back(std::move(att));
+    }
+    bool has_more = false;
+    if (v.is_object()) {
+      auto it = v.as_object().find("has_more");
+      has_more = it != v.as_object().end() && it->value().is_bool() && it->value().as_bool();
+    }
+    if (!has_more || !added || !last || last == after) break;
+    after = std::move(last);
+  }
   return out;
 }
 

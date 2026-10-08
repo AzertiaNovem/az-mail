@@ -259,6 +259,7 @@ const std::vector<Key>& keys() {
          return {};
        }},
       {"RESEND_TIMEOUT_SEC", integer(&Config::resend_timeout_sec)},
+      {"RESEND_UPLOAD_KBPS", integer(&Config::resend_upload_kbps)},
       {"AZMAIL_WEBHOOK_TOLERANCE_SEC", integer(&Config::webhook_tolerance_sec)},
       // outbound HTTP client
       {"AZMAIL_ALLOW_INSECURE_HTTP", boolean(&Config::allow_insecure_http)},
@@ -489,6 +490,78 @@ ConfigLoad config_from_env(const EnvMap& env) {
   return r;
 }
 
+// ---- secret strength (F2) --------------------------------------------------------------------------
+
+namespace {
+
+// Markers of example/placeholder values (compared case-insensitively, '-' and '_' alike):
+// deploy/azmail.env.example ships "CHANGE_ME_generate_with_openssl_rand_hex_32".
+constexpr std::string_view kPlaceholderMarkers[] = {"change_me", "changeme", "replace_me", "replaceme",
+                                                    "placeholder", "your_secret", "example_secret"};
+
+bool looks_like_placeholder(std::string_view s) {
+  std::string folded = to_lower_ascii(s);
+  for (char& ch : folded)
+    if (ch == '-') ch = '_';
+  for (auto marker : kPlaceholderMarkers)
+    if (folded.find(marker) != std::string::npos) return true;
+  return false;
+}
+
+std::size_t distinct_bytes(std::string_view s) {
+  bool seen[256] = {};
+  std::size_t n = 0;
+  for (unsigned char ch : s)
+    if (!seen[ch]) {
+      seen[ch] = true;
+      ++n;
+    }
+  return n;
+}
+
+// True when `s` is two or more copies of one shorter unit ("abcdabcd…").
+bool is_repetition(std::string_view s) {
+  const std::size_t n = s.size();
+  for (std::size_t p = 1; p <= n / 2; ++p) {
+    if (n % p != 0) continue;
+    bool same = true;
+    for (std::size_t i = p; i < n && same; ++i) same = s[i] == s[i - p];
+    if (same) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+bool degenerate_secret(std::string_view s) { return distinct_bytes(s) < 8 || is_repetition(s); }
+
+std::optional<std::string> server_secret_problem(std::string_view s) {
+  if (s.empty())
+    return "AZMAIL_SECRET is required (>= 32 random bytes, e.g. `openssl rand -hex 32`) / "
+           "必须设置 AZMAIL_SECRET（至少 32 字节随机值）";
+  if (looks_like_placeholder(s))
+    return "AZMAIL_SECRET still holds the example placeholder: generate one with `openssl rand -hex 32` / "
+           "AZMAIL_SECRET 仍是示例占位值，请用 `openssl rand -hex 32` 生成";
+  if (s.size() < 32) return "AZMAIL_SECRET is too short: it needs >= 32 bytes / AZMAIL_SECRET 太短，至少需要 32 字节";
+  // Only obviously hand-made values (one character over and over, a repeated pattern, a handful
+  // of distinct characters): every real generator output (hex, base64, alphanumeric) passes.
+  if (degenerate_secret(s))
+    return "AZMAIL_SECRET is not random (repeated characters or pattern): generate one with "
+           "`openssl rand -hex 32` / AZMAIL_SECRET 不是随机值，请用 `openssl rand -hex 32` 生成";
+  return std::nullopt;
+}
+
+std::optional<std::string> webhook_secret_problem(std::string_view s) {
+  if (!s.starts_with("whsec_")) return "RESEND_WEBHOOK_SECRET must start with 'whsec_' / RESEND_WEBHOOK_SECRET 必须以 whsec_ 开头";
+  const std::string_view body = trim(s.substr(6));
+  const std::string_view unpadded = body.substr(0, body.find_last_not_of('=') + 1);
+  const auto key = crypto::b64_decode(body);
+  if (looks_like_placeholder(body) || distinct_bytes(unpadded) < 4 || !key || key->size() < 16)
+    return "RESEND_WEBHOOK_SECRET is not a real signing secret (copy it from the Resend webhook page: whsec_ + base64) / "
+           "RESEND_WEBHOOK_SECRET 不是有效的签名密钥（请从 Resend webhook 页面复制）";
+  return std::nullopt;
+}
+
 // ---- validation ----------------------------------------------------------------------------------
 
 std::vector<std::string> validate_config(const Config& c, ConfigPurpose purpose) {
@@ -548,11 +621,9 @@ std::vector<std::string> validate_config(const Config& c, ConfigPurpose purpose)
   at_least(c.shutdown_grace_sec, 1, "AZMAIL_SHUTDOWN_GRACE_SEC");
 
   // ---- security ----------------------------------------------------------------------------------
-  if (c.server_secret.empty())
-    p.push_back("AZMAIL_SECRET is required (>= 32 random bytes, e.g. `openssl rand -hex 32`) / "
-                "必须设置 AZMAIL_SECRET（至少 32 字节随机值）");
-  else if (c.server_secret.size() < 32)
-    p.push_back("AZMAIL_SECRET is too short: it needs >= 32 bytes / AZMAIL_SECRET 太短，至少需要 32 字节");
+  // The secret is the only key of the signed file URLs: an example or guessable value lets anyone
+  // forge links to every user's attachments and raw mail (F2).
+  if (auto problem = server_secret_problem(c.server_secret)) p.push_back(std::move(*problem));
   at_least(c.session_ttl_days, 1, "AZMAIL_SESSION_TTL_DAYS");
   at_least(c.session_touch_interval_sec, 1, "AZMAIL_SESSION_TOUCH_SEC");
   at_least(c.login_max_per_email, 1, "AZMAIL_LOGIN_MAX_PER_EMAIL");
@@ -598,12 +669,13 @@ std::vector<std::string> validate_config(const Config& c, ConfigPurpose purpose)
   need(is_https(c.resend_api_base) || c.allow_insecure_http,
        "RESEND_API_BASE uses http:// but AZMAIL_ALLOW_INSECURE_HTTP is not set (mock only) / "
        "RESEND_API_BASE 使用 http:// 时必须设置 AZMAIL_ALLOW_INSECURE_HTTP=1（仅限模拟服务）");
-  need(c.resend_webhook_secret.empty() || c.resend_webhook_secret.starts_with("whsec_"),
-       "RESEND_WEBHOOK_SECRET must start with 'whsec_' / RESEND_WEBHOOK_SECRET 必须以 whsec_ 开头");
+  if (!c.resend_webhook_secret.empty())
+    if (auto problem = webhook_secret_problem(c.resend_webhook_secret)) p.push_back(std::move(*problem));
   need(!trim(c.resend_user_agent).empty(),
        "RESEND_USER_AGENT must not be empty (Cloudflare rejects requests without it) / RESEND_USER_AGENT 不能为空");
   need(c.resend_rate_rps > 0 && c.resend_rate_rps <= 100, "RESEND_RATE_RPS must be in (0, 100] / 速率必须在 0 到 100 之间");
   at_least(c.resend_timeout_sec, 1, "RESEND_TIMEOUT_SEC");
+  at_least(c.resend_upload_kbps, 1, "RESEND_UPLOAD_KBPS");
   at_least(c.webhook_tolerance_sec, 1, "AZMAIL_WEBHOOK_TOLERANCE_SEC");
   if (!c.ca_file.empty()) {
     std::error_code ec;
@@ -660,6 +732,12 @@ std::vector<std::string> config_warnings(const Config& c) {
                 "未配置跨域来源，浏览器无法跨域访问");
   if (c.allow_insecure_http)
     w.push_back("AZMAIL_ALLOW_INSECURE_HTTP=1 allows plain http:// to Resend/R2 (mock only) / 已允许不安全的 http 连接（仅限测试）");
+  // A graceful shutdown takes at most AZMAIL_SHUTDOWN_GRACE_SEC in total (F6); the shipped unit
+  // stops with TimeoutStopSec=40, which has to stay above it.
+  if (c.shutdown_grace_sec > 35)
+    w.push_back("AZMAIL_SHUTDOWN_GRACE_SEC (" + std::to_string(c.shutdown_grace_sec) +
+                ") is above 35 s: raise systemd TimeoutStopSec (40 s in deploy/azmail.service) above it / "
+                "AZMAIL_SHUTDOWN_GRACE_SEC 超过 35 秒：请把 systemd 的 TimeoutStopSec 调到更大");
   return w;
 }
 

@@ -3,7 +3,10 @@
 #include "http/throttle.hpp"
 
 #include "config.hpp"
+#include "core/crypto.hpp"
 #include "core/strings.hpp"
+
+#include <boost/asio/ip/address.hpp>
 
 #include <algorithm>
 #include <condition_variable>
@@ -32,6 +35,9 @@ std::optional<int> blocked_for(const Window& w, int max, int64_t now, int64_t wi
   const int64_t ms = std::max<int64_t>(leaves_at - now, 1);
   return static_cast<int>((ms + 999) / 1000);
 }
+
+// Fixed-size key of a (normalized) email: memory per entry never depends on what was sent.
+std::string email_key(std::string_view email) { return crypto::sha256(to_lower_ascii(trim(email))); }
 
 LoginThrottle::Limits limits_from(const Config& cfg) {
   LoginThrottle::Limits l;
@@ -80,6 +86,20 @@ struct LoginThrottle::Impl {
       }
     }
   }
+
+  // Keeps `m` at most kMaxKeys entries: prune first, then evict the entries whose latest failure
+  // is oldest (a tenth at a time, so a flood pays the scan rarely).
+  void cap_locked(std::unordered_map<std::string, Window>& m, int64_t now) const {
+    if (m.size() <= kMaxKeys) return;
+    prune_locked(now);
+    if (m.size() <= kMaxKeys) return;
+    std::vector<std::pair<int64_t, std::string>> by_age;
+    by_age.reserve(m.size());
+    for (const auto& [k, w] : m) by_age.emplace_back(w.empty() ? 0 : w.back(), k);
+    const std::size_t drop = m.size() - kMaxKeys + kMaxKeys / 10;
+    std::nth_element(by_age.begin(), by_age.begin() + static_cast<std::ptrdiff_t>(drop - 1), by_age.end());
+    for (std::size_t i = 0; i < drop; ++i) m.erase(by_age[i].second);
+  }
 };
 
 LoginThrottle::LoginThrottle(Limits limits, const Clock& clock)
@@ -99,21 +119,27 @@ std::optional<int> LoginThrottle::check(std::string_view email, std::string_view
     if (auto s = blocked_for(it->second, max, now, impl_->window_ms)) worst = std::max(worst.value_or(0), *s);
     if (it->second.empty()) map.erase(it);
   };
-  consider(impl_->by_email, to_lower_ascii(trim(email)), impl_->limits.max_per_email);
-  if (!ip.empty()) consider(impl_->by_ip, std::string(ip), impl_->limits.max_per_ip);
+  if (!trim(email).empty()) consider(impl_->by_email, email_key(email), impl_->limits.max_per_email);
+  if (!ip.empty()) consider(impl_->by_ip, ip_key(ip), impl_->limits.max_per_ip);
   return worst;
 }
 
 void LoginThrottle::record_failure(std::string_view email, std::string_view ip) {
   const int64_t now = impl_->clock.now_ms();
+  const std::string ekey = trim(email).empty() ? std::string() : email_key(email);
+  const std::string ikey = ip.empty() ? std::string() : ip_key(ip);
   std::lock_guard lk(impl_->mu);
-  auto& ew = impl_->by_email[to_lower_ascii(trim(email))];
-  slide(ew, now, impl_->window_ms);
-  Impl::push_bounded(ew, now, impl_->limits.max_per_email);
-  if (!ip.empty()) {
-    auto& iw = impl_->by_ip[std::string(ip)];
+  if (!ekey.empty()) {
+    auto& ew = impl_->by_email[ekey];
+    slide(ew, now, impl_->window_ms);
+    Impl::push_bounded(ew, now, impl_->limits.max_per_email);
+    impl_->cap_locked(impl_->by_email, now);
+  }
+  if (!ikey.empty()) {
+    auto& iw = impl_->by_ip[ikey];
     slide(iw, now, impl_->window_ms);
     Impl::push_bounded(iw, now, impl_->limits.max_per_ip);
+    impl_->cap_locked(impl_->by_ip, now);
   }
   // Opportunistic cleanup so a spray of distinct emails/IPs cannot grow the maps forever.
   if (++impl_->ops_since_prune >= 1024) {
@@ -124,8 +150,34 @@ void LoginThrottle::record_failure(std::string_view email, std::string_view ip) 
 
 void LoginThrottle::record_success(std::string_view email, std::string_view ip) {
   (void)ip;  // the IP window keeps sliding (one account's success says nothing about the IP)
+  if (trim(email).empty()) return;
+  const std::string ekey = email_key(email);
   std::lock_guard lk(impl_->mu);
-  impl_->by_email.erase(to_lower_ascii(trim(email)));
+  impl_->by_email.erase(ekey);
+}
+
+std::size_t LoginThrottle::email_keys() const {
+  std::lock_guard lk(impl_->mu);
+  return impl_->by_email.size();
+}
+
+std::size_t LoginThrottle::ip_keys() const {
+  std::lock_guard lk(impl_->mu);
+  return impl_->by_ip.size();
+}
+
+std::string LoginThrottle::ip_key(std::string_view ip) {
+  std::string_view s = trim(ip);
+  if (s.size() >= 2 && s.front() == '[' && s.back() == ']') s = s.substr(1, s.size() - 2);
+  boost::system::error_code ec;
+  const auto a = boost::asio::ip::make_address(std::string(s), ec);
+  if (ec) return std::string(s.substr(0, 64));
+  if (a.is_v4()) return a.to_string();
+  const auto v6 = a.to_v6();
+  if (v6.is_v4_mapped()) return boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, v6).to_string();
+  auto bytes = v6.to_bytes();
+  for (std::size_t i = 8; i < bytes.size(); ++i) bytes[i] = 0;
+  return boost::asio::ip::address_v6(bytes).to_string() + "/64";
 }
 
 LoginThrottle::ScryptPermit::~ScryptPermit() {

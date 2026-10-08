@@ -183,3 +183,26 @@ interface JobRow { id:number; kind:string; lane:string; priority:number; payload
 
 ### WebSocket frames
 Server frames are **flat**: the Hub serializes the fields of `data` beside `type` (`{type, ...data}`), never `{type, data:{…}}`. Events with no contents are `{type}`. `mail.new.from` is an Address `{name,email}`. `outbound.status.status_detail` is `string|null`.
+
+## Addendum B.1 — additive fields and behaviour fixed during the review (be_infra)
+
+### `GET /api/admin/stats` (additive)
+```ts
+interface AdminStats {
+  // … every field of Addendum B / the table above, unchanged …
+  queue: { pending:number; dead:number;
+           periodic:number };            // of `pending`: periodic jobs (dedupe "periodic:<kind>", always queued)
+  poll_gap: { detected_at:number;          // ms epoch: when the poller last detected the gap
+              detail:string } | null;      // Chinese, no mail content; null when no warning
+}
+```
+- `queue.periodic` counts the pending/running jobs whose dedupe key is `periodic:<kind>` (poll, reconcile, gc …). They are always present, so the real backlog is `queue.pending - queue.periodic`.
+- `poll_gap` is the `poll.receiving` gap warning (DESIGN B7, kv `poll.gap_warning`): mail older than the last sync position that had never been seen (webhook delivery failed), or the last sync position was not found again (outage beyond Resend's 30-day retention or more than 20 pages — mail of that period may be lost). It is shown for 7 days after `detected_at` and then dropped (the next poll deletes it); a new detection replaces it. Clients show it as a warning banner.
+
+### `POST /api/auth/login` (behaviour)
+- Body limit 8 KiB (413 `payload_too_large` above it). An `email` that is not a valid address or is longer than 254 bytes is answered like an unknown account: 401 `invalid_credentials` (it still counts against the client IP's throttle).
+- A disabled account answers 403 `account_disabled` **whatever the password** (it no longer confirms a correct guess), and every such attempt counts against the throttle like a wrong password.
+- The per-IP throttle counts IPv6 clients per /64.
+
+### Authenticated routes with a body (behaviour)
+- Every `U`/`A` route with a request body checks the Bearer token **before** reading the body: 401 `unauthorized` (403 `forbidden` for non-admins on `A` routes) with `Connection: close`, whatever the body size. The 413 `payload_too_large` check on `Content-Length` still comes first.

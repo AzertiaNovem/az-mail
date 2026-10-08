@@ -60,4 +60,17 @@ std::vector<std::string> config_warnings(const Config& cfg);
 // AZMAIL_SECRET decoding ("hex:", "base64:" prefixes, else raw). nullopt for a bad encoding.
 std::optional<std::string> decode_secret(std::string_view value);
 
+// ---- additive (F2): secret strength ----------------------------------------------------------
+// True for an obviously non-random secret: fewer than 8 distinct bytes, or two or more copies
+// of one shorter unit. Never true for `openssl rand -hex 32` / base64 output in practice.
+bool degenerate_secret(std::string_view secret);
+// Why `secret` (decoded AZMAIL_SECRET) must not be used: empty → required; the placeholder of
+// deploy/azmail.env.example (anything containing CHANGE_ME / change-me / placeholder …);
+// shorter than 32 bytes; degenerate_secret.
+// nullopt when acceptable. Bilingual, never contains the secret.
+std::optional<std::string> server_secret_problem(std::string_view secret);
+// Same for RESEND_WEBHOOK_SECRET (non-empty): must be "whsec_" + base64 of >= 16 bytes, not a
+// placeholder (one repeated character, "xxxx…", CHANGE_ME …).
+std::optional<std::string> webhook_secret_problem(std::string_view secret);
+
 }  // namespace azm::app

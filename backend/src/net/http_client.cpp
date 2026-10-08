@@ -26,13 +26,54 @@
 #include <openssl/ssl.h>
 #include <openssl/x509_vfy.h>
 
+#include <algorithm>
+#include <atomic>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 namespace azm::net {
+
+// ---- CancelSignal (RT-7) ------------------------------------------------------------------------
+
+struct CancelSignal::Impl {
+  std::atomic<bool> fired{false};
+  std::mutex mu;
+  std::vector<boost::asio::io_context*> active;  // private io_contexts of sends in flight (mu)
+
+  // False (nothing registered) when the signal already fired.
+  bool add(boost::asio::io_context* ioc) {
+    std::lock_guard lk(mu);
+    if (fired.load()) return false;
+    active.push_back(ioc);
+    return true;
+  }
+  void remove(boost::asio::io_context* ioc) {
+    std::lock_guard lk(mu);
+    std::erase(active, ioc);
+  }
+};
+
+CancelSignal::CancelSignal() : impl_(std::make_unique<Impl>()) {}
+CancelSignal::~CancelSignal() = default;
+
+void CancelSignal::cancel() noexcept {
+  std::lock_guard lk(impl_->mu);
+  impl_->fired.store(true);
+  // io_context::stop() is thread-safe; a run() that has not started yet returns at once.
+  for (auto* ioc : impl_->active) ioc->stop();
+}
+
+bool CancelSignal::cancelled() const noexcept { return impl_->fired.load(); }
+
 namespace {
+
+[[noreturn]] void throw_aborted() {
+  throw NetError(NetError::Kind::Aborted, "request aborted: the server is shutting down");
+}
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
@@ -166,7 +207,7 @@ bool is_tls_error(const boost::system::error_code& ec) {
 // ---- DNS ---------------------------------------------------------------------------------------
 
 std::vector<tcp::endpoint> resolve(const Target& t, const Deadline& dl,
-                                   std::chrono::milliseconds connect_timeout) {
+                                   std::chrono::milliseconds connect_timeout, const CancelSignal* cancel) {
   const auto port = static_cast<std::uint16_t>(std::stoi(t.port));
   if (is_ip_literal(t.host)) return {tcp::endpoint(asio::ip::make_address(t.host), port)};
   // getaddrinfo cannot be interrupted: run it on a detached helper so the caller can give up at
@@ -184,8 +225,15 @@ std::vector<tcp::endpoint> resolve(const Target& t, const Deadline& dl,
       promise->set_exception(std::current_exception());
     }
   }).detach();
-  if (future.wait_for(dl.budget(connect_timeout)) != std::future_status::ready)
-    throw NetError(NetError::Kind::Timeout, "DNS lookup of " + t.host + " timed out");
+  // Waited for in short slices so a shutdown abort (RT-7) does not wait for a slow resolver.
+  const auto give_up = SteadyClock::now() + dl.budget(connect_timeout);
+  for (;;) {
+    if (cancel != nullptr && cancel->cancelled()) throw_aborted();
+    const auto now = SteadyClock::now();
+    if (now >= give_up) throw NetError(NetError::Kind::Timeout, "DNS lookup of " + t.host + " timed out");
+    const auto slice = std::min<SteadyClock::duration>(give_up - now, std::chrono::milliseconds(50));
+    if (future.wait_for(slice) == std::future_status::ready) break;
+  }
   try {
     auto eps = future.get();
     if (eps.empty()) throw NetError(NetError::Kind::Connect, "DNS lookup of " + t.host + " returned no addresses");
@@ -214,6 +262,7 @@ struct HopInput {
   bool follow_redirects = false;  // read only the head of 3xx bodies
   const fs::path* sink = nullptr;
   std::size_t max_body = 0;
+  std::optional<std::chrono::milliseconds> response_timeout;  // HttpRequest::response_timeout
 };
 
 struct HopResult {
@@ -313,7 +362,7 @@ asio::awaitable<HopResult> exchange(Stream& stream, const HopInput& in, const De
   parser.header_limit(kHeaderLimit);
   parser.body_limit(boost::none);  // enforced below per destination
   if (in.method == http::verb::head) parser.skip(true);
-  lowest(stream).expires_after(dl.budget(opts.read_timeout));
+  lowest(stream).expires_after(dl.budget(in.response_timeout.value_or(opts.read_timeout)));
   {
     auto [ec, n] = co_await http::async_read_header(stream, buf, parser, tuple_awaitable);
     (void)n;
@@ -332,7 +381,10 @@ asio::awaitable<HopResult> exchange(Stream& stream, const HopInput& in, const De
   BodyDest dest = BodyDest::String;
   if (out.location) dest = BodyDest::Truncated;
   else if (in.sink != nullptr) dest = (out.resp.status >= 200 && out.resp.status < 300) ? BodyDest::Sink : BodyDest::Truncated;
-  if (dest != BodyDest::Truncated) {
+  // Only when a body will actually be read: HEAD responses (parser.skip), 1xx/204/304 and
+  // "Content-Length: 0" are complete right after the header although content_length() still
+  // reports the header value — a HEAD of a large R2 object must not fail as TooLarge (RT-1).
+  if (dest != BodyDest::Truncated && !parser.is_done()) {
     if (auto len = parser.content_length(); len && *len > in.max_body)
       throw NetError(NetError::Kind::TooLarge, "response body of " + std::to_string(*len) +
                                                    " bytes exceeds the limit of " + std::to_string(in.max_body));
@@ -486,10 +538,14 @@ HttpClient::~HttpClient() = default;
 
 const ClientOptions& HttpClient::options() const { return impl_->opts; }
 
+bool HttpClient::cancelled() const { return impl_->opts.cancel && impl_->opts.cancel->cancelled(); }
+
 HttpResponse HttpClient::send(const HttpRequest& req) {
   const ClientOptions& opts = impl_->opts;
   if (!req.body.empty() && req.body_file)
     throw std::invalid_argument("HttpRequest: set either body or body_file, not both");
+  CancelSignal* cancel = opts.cancel.get();
+  if (cancel != nullptr && cancel->cancelled()) throw_aborted();
   Deadline dl;
   dl.total = req.timeout;
   if (req.timeout.count() > 0) dl.at = SteadyClock::now() + req.timeout;
@@ -522,7 +578,7 @@ HttpResponse HttpClient::send(const HttpRequest& req) {
       throw NetError(NetError::Kind::Tls,
                      impl_->tls_error.empty() ? "TLS is not available in this client" : impl_->tls_error);
     }
-    auto eps = resolve(t, dl, opts.connect_timeout);
+    auto eps = resolve(t, dl, opts.connect_timeout, cancel);
 
     HopInput in;
     in.target = &t;
@@ -535,6 +591,7 @@ HttpResponse HttpClient::send(const HttpRequest& req) {
     in.follow_redirects = req.max_redirects > 0;
     in.sink = req.sink ? &*req.sink : nullptr;
     in.max_body = req.max_body;
+    in.response_timeout = req.response_timeout;
 
     asio::io_context ioc;
     std::exception_ptr err;
@@ -545,9 +602,27 @@ HttpResponse HttpClient::send(const HttpRequest& req) {
     };
     if (t.tls) asio::co_spawn(ioc, tls_hop(ioc, *impl_->tls, std::move(eps), in, dl, opts), on_done);
     else asio::co_spawn(ioc, plain_hop(ioc, std::move(eps), in, dl, opts), on_done);
-    ioc.run();
+    {
+      // While registered, CancelSignal::cancel() stops this io_context: run() returns with the
+      // hop unfinished and the hop's frame (stream, partial sink file) is destroyed with `ioc`.
+      struct Registration {
+        CancelSignal* sig;
+        asio::io_context* ioc;
+        ~Registration() {
+          if (sig != nullptr) sig->impl_->remove(ioc);
+        }
+      } reg{nullptr, &ioc};
+      if (cancel != nullptr) {
+        if (!cancel->impl_->add(&ioc)) throw_aborted();
+        reg.sig = cancel;
+      }
+      ioc.run();
+    }
     if (err) std::rethrow_exception(err);
-    if (!result) throw NetError(NetError::Kind::Protocol, "request did not complete");
+    if (!result) {
+      if (cancel != nullptr && cancel->cancelled()) throw_aborted();
+      throw NetError(NetError::Kind::Protocol, "request did not complete");
+    }
 
     if (!result->location) return std::move(result->resp);
     if (hop >= req.max_redirects)

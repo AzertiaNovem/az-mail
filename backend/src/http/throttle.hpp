@@ -7,6 +7,10 @@
 //   * record_failure() after a failed login (unknown email counts too); record_success()
 //     clears the email's counter (the IP counter keeps sliding).
 // Thread-safe. In-memory only (resets on restart). Emails are compared normalized (lowercase).
+// Memory is bounded whatever clients send (SEC-2): emails are keyed by their sha256 (32 bytes,
+// never the attacker-sized string), an empty email counts against the IP only, IPv6 clients
+// are counted per /64 (one subscriber's prefix), and each map keeps at most kMaxKeys entries
+// (the stalest are evicted first).
 #pragma once
 
 #include "core/time.hpp"
@@ -30,6 +34,9 @@ class LoginThrottle {
     std::chrono::seconds window{900};  // sliding window (cfg.login_window_sec)
     int scrypt_concurrency = 4;        // concurrent scrypt permits (cfg.scrypt_concurrency)
   };
+
+  // Additive (SEC-2): entry cap per map (emails, IPs).
+  static constexpr std::size_t kMaxKeys = 100'000;
 
   explicit LoginThrottle(Limits limits, const Clock& clock = system_clock());
   explicit LoginThrottle(const Config& cfg, const Clock& clock = system_clock());
@@ -62,6 +69,13 @@ class LoginThrottle {
 
   // Drops entries whose failures all left the window (also done opportunistically).
   void prune();
+
+  // Additive (SEC-2, tests/metrics): current number of tracked emails and IP keys.
+  std::size_t email_keys() const;
+  std::size_t ip_keys() const;
+  // Additive (SEC-2): the per-IP key — IPv4 (and IPv4-mapped IPv6) as is, other IPv6 addresses
+  // as their /64 prefix ("2001:db8:1:2::/64"), anything unparsable as given (≤ 64 bytes).
+  static std::string ip_key(std::string_view ip);
 
  private:
   void release_scrypt() noexcept;

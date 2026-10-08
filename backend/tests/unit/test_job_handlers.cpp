@@ -499,3 +499,193 @@ TEST_CASE("gc.blobs: unreferenced old blobs are removed from the store and the t
   CHECK(ts.db.read([](db::Conn& c) { return c.scalar<int64_t>("SELECT COUNT(*) FROM blobs"); }) ==
         std::optional<int64_t>(0));
 }
+
+// ---- be_infra regressions -------------------------------------------------------------------------
+
+namespace {
+
+// An inbound.fetch job claimed by this "worker" (state running), so ensure_lease succeeds.
+Job claimed_fetch(test::TestServices& ts, std::string_view resend_id, int attempts, int max_attempts) {
+  Job j = job_of(kinds::kInboundFetch, {{"resend_id", resend_id}, {"source", "webhook"}}, attempts, max_attempts);
+  j.id = ts.db.write([&](db::Tx& tx) {
+    mail::record_inbound_pending(tx, resend_id, mail::InboundSource::Webhook, ts.clock.now_ms());
+    const int64_t id = enqueue(tx, kinds::kInboundFetch, j.payload,
+                               {.dedupe_key = dedupe_inbound_fetch(resend_id), .max_attempts = max_attempts,
+                                .now_ms = ts.clock.now_ms()});
+    tx.run("UPDATE jobs SET state='running', attempts=?, locked_until=? WHERE id=?", attempts,
+           ts.clock.now_ms() + 60'000, id);
+    return id;
+  });
+  return j;
+}
+
+resend::ReceivedEmail received_for_bob(std::string id, int announced_attachments) {
+  resend::ReceivedEmail rcv;
+  rcv.id = std::move(id);
+  rcv.from = "Ext <ext@outside.example>";
+  rcv.to = {"bob@team.example"};
+  rcv.received_for = {"bob@team.example"};
+  rcv.subject = "parts";
+  rcv.text = "body";
+  for (int i = 1; i <= announced_attachments; ++i)
+    rcv.attachments.push_back({"att_" + std::to_string(i), "f" + std::to_string(i) + ".txt", "text/plain",
+                               "attachment", std::nullopt, 1, ""});
+  return rcv;
+}
+
+std::optional<mail::InboundState> inbound(test::TestServices& ts, std::string_view id) {
+  return ts.db.read([&](db::Conn& c) { return mail::inbound_state(c, id); });
+}
+
+}  // namespace
+
+TEST_CASE("inbound.fetch: an attachment listing shorter than announced is retried, not delivered (RT-2)",
+          "[job_handlers][.integration]") {
+  test::TestServices ts;
+  FakeResend fake;
+  ts.svc.resend = &fake;
+  const int64_t bob = ts.db.write([](db::Tx& tx) { return test::seed_user(tx, "bob@team.example"); });
+  fake.received["in_p"] = received_for_bob("in_p", 3);
+  for (int i = 1; i <= 2; ++i) {  // only 2 of the 3 announced parts are listed
+    const std::string n = std::to_string(i);
+    fake.attachments["in_p"].push_back(
+        {"att_" + n, "f" + n + ".txt", "text/plain", "attachment", std::nullopt, 1, "https://dl/att_" + n});
+    fake.downloads["https://dl/att_" + n] = n;
+  }
+  std::stop_source ss;
+  const auto r = thrown<Retry>([&] { run_inbound_fetch(ts.svc, claimed_fetch(ts, "in_p", 1, 8), ss.get_token()); });
+  CHECK(r.count_attempt);
+  CHECK(r.reason.find("incomplete") != std::string::npos);
+  CHECK(inbound(ts, "in_p") == std::optional<mail::InboundState>(mail::InboundState::Pending));
+
+  // Complete listing on a later attempt: every part is delivered.
+  fake.attachments["in_p"].push_back({"att_3", "f3.txt", "text/plain", "attachment", std::nullopt, 1, "https://dl/att_3"});
+  fake.downloads["https://dl/att_3"] = "3";
+  ts.db.write([](db::Tx& tx) { tx.run("UPDATE jobs SET attempts=2"); });
+  Job again = job_of(kinds::kInboundFetch, {{"resend_id", "in_p"}, {"source", "webhook"}}, 2, 8);
+  again.id = ts.db.read([](db::Conn& c) {
+    return *c.scalar<int64_t>("SELECT id FROM jobs WHERE dedupe_key=?", dedupe_inbound_fetch("in_p"));
+  });
+  run_inbound_fetch(ts.svc, again, ss.get_token());
+  CHECK(inbound(ts, "in_p") == std::optional<mail::InboundState>(mail::InboundState::Delivered));
+  CHECK(ts.db.read([&](db::Conn& c) {
+    return c.scalar<int64_t>("SELECT COUNT(*) FROM attachments WHERE owner_id=?", bob);
+  }) == std::optional<int64_t>(3));
+}
+
+TEST_CASE("inbound.fetch: the last attempt delivers what was listed (RT-2)", "[job_handlers][.integration]") {
+  test::TestServices ts;
+  FakeResend fake;
+  ts.svc.resend = &fake;
+  ts.db.write([](db::Tx& tx) { return test::seed_user(tx, "bob@team.example"); });
+  fake.received["in_l"] = received_for_bob("in_l", 2);
+  fake.attachments["in_l"] = {{"att_1", "f1.txt", "text/plain", "attachment", std::nullopt, 1, "https://dl/1"}};
+  fake.downloads["https://dl/1"] = "1";
+  std::stop_source ss;
+  run_inbound_fetch(ts.svc, claimed_fetch(ts, "in_l", 3, 3), ss.get_token());
+  CHECK(inbound(ts, "in_l") == std::optional<mail::InboundState>(mail::InboundState::Delivered));
+}
+
+TEST_CASE("inbound.fetch: failures during shutdown give the attempt back and never mark failed (RT-7)",
+          "[job_handlers][.integration]") {
+  test::TestServices ts;
+  FakeResend fake;
+  ts.svc.resend = &fake;
+  ts.db.write([](db::Tx& tx) { return test::seed_user(tx, "bob@team.example"); });
+  fake.received["in_s"] = received_for_bob("in_s", 0);
+  fake.received["in_s"].raw_download_url = "https://dl/missing";  // download fails (as an aborted transfer would)
+  std::stop_source ss;
+  ss.request_stop();
+  const auto r = thrown<Retry>([&] { run_inbound_fetch(ts.svc, claimed_fetch(ts, "in_s", 5, 5), ss.get_token()); });
+  CHECK_FALSE(r.count_attempt);
+  CHECK(inbound(ts, "in_s") == std::optional<mail::InboundState>(mail::InboundState::Pending));
+  // Without a shutdown the same last attempt records the failure.
+  std::stop_source live;
+  Job j = job_of(kinds::kInboundFetch, {{"resend_id", "in_s"}, {"source", "webhook"}}, 5, 5);
+  j.id = ts.db.read([](db::Conn& c) { return *c.scalar<int64_t>("SELECT id FROM jobs"); });
+  CHECK_THROWS_AS(run_inbound_fetch(ts.svc, j, live.get_token()), Retry);
+  CHECK(inbound(ts, "in_s") == std::optional<mail::InboundState>(mail::InboundState::Failed));
+}
+
+TEST_CASE("inbound.fetch: given up by lease recovery → the inbound row is marked failed (RT-8)",
+          "[job_handlers][.integration]") {
+  test::TestServices ts;
+  RunnerConfig rc;
+  rc.lane_threads = {};
+  Runner runner(ts.db, ts.svc, rc);
+  register_inbound_jobs(runner);
+  const int64_t now = ts.clock.now_ms();
+  ts.db.write([&](db::Tx& tx) {
+    mail::record_inbound_pending(tx, "in_d", mail::InboundSource::Webhook, now);
+    mail::record_inbound_pending(tx, "in_ok", mail::InboundSource::Webhook, now);
+    const int64_t a = enqueue(tx, kinds::kInboundFetch, {{"resend_id", "in_d"}}, {.max_attempts = 2, .now_ms = now});
+    const int64_t b = enqueue(tx, kinds::kInboundFetch, {{"resend_id", "in_ok"}}, {.max_attempts = 2, .now_ms = now});
+    tx.run("UPDATE jobs SET state='running', attempts=3, locked_until=? WHERE id=?", now - 1, a);  // beyond max
+    tx.run("UPDATE jobs SET state='running', attempts=1, locked_until=? WHERE id=?", now - 1, b);  // retried
+  });
+  CHECK(runner.recover_expired() == 2);
+  CHECK(inbound(ts, "in_d") == std::optional<mail::InboundState>(mail::InboundState::Failed));
+  CHECK(inbound(ts, "in_ok") == std::optional<mail::InboundState>(mail::InboundState::Pending));
+  // gc.housekeeping goes through the Runner, so its lease step runs the hook too.
+  ts.svc.runner = &runner;
+  ts.db.write([&](db::Tx& tx) {
+    mail::record_inbound_pending(tx, "in_h", mail::InboundSource::Webhook, now);
+    const int64_t c = enqueue(tx, kinds::kInboundFetch, {{"resend_id", "in_h"}}, {.max_attempts = 1, .now_ms = now});
+    tx.run("UPDATE jobs SET state='running', attempts=2, locked_until=? WHERE id=?", now - 1, c);
+  });
+  std::stop_source ss;
+  try {
+    run_gc_housekeeping(ts.svc, job_of(kinds::kGcHousekeeping, {}), ss.get_token());
+  } catch (const std::exception&) {
+  }
+  CHECK(inbound(ts, "in_h") == std::optional<mail::InboundState>(mail::InboundState::Failed));
+  ts.svc.runner = nullptr;
+}
+
+TEST_CASE("poll.receiving: runs at exactly AZMAIL_POLL_INTERVAL_SEC (no hidden floor)", "[job_handlers]") {
+  test::TestServices ts;
+  ts.cfg.poll_interval_sec = 5;
+  RunnerConfig rc;
+  rc.lane_threads = {};
+  Runner runner(ts.db, ts.svc, rc);
+  register_inbound_jobs(runner);
+  runner.start();
+  REQUIRE(runner.run_one("sync"));  // the seeded poll (no Resend client: a no-op)
+  CHECK(ts.db.read([&](db::Conn& c) {
+    return c.scalar<int64_t>("SELECT run_at FROM jobs WHERE kind='poll.receiving' AND state='pending'");
+  }) == std::optional<int64_t>(ts.clock.now_ms() + 5000));
+  runner.stop();
+}
+
+TEST_CASE("poll.receiving: gap warning carries its detection time; old warnings are dropped (F4)",
+          "[job_handlers][.integration]") {
+  test::TestServices ts;
+  FakeResend fake;
+  ts.svc.resend = &fake;
+  const int64_t now = ts.clock.now_ms();
+  ts.db.write([&](db::Tx& tx) {
+    mail::record_inbound_pending(tx, "in_1", mail::InboundSource::Webhook, 1);
+    db::kv_set(tx, db::kv_keys::kPollHighWater, "in_3", 1);
+  });
+  fake.pages.push_back({{"in_5", "in_3", "in_2", "in_1"}, true});
+  std::stop_source ss;
+  run_poll_receiving(ts.svc, job_of(kinds::kPollReceiving, {}), ss.get_token());
+  ts.db.read([&](db::Conn& c) {
+    auto s = c.prepare("SELECT value, updated_at FROM kv WHERE key=?");
+    s.bind_all(db::kv_keys::kPollGapWarning);
+    REQUIRE(s.step());
+    CHECK(s.text(0).rfind("发现 2 封", 0) == 0);  // detail only; the time is updated_at
+    CHECK(s.i64(1) == now);
+    const auto stats = repo::admin_stats(c, now);
+    REQUIRE(stats.poll_gap.has_value());
+    CHECK(stats.poll_gap->detected_at == now);
+  });
+  // A quiet poll keeps a recent warning; once it is older than 7 days the next poll deletes it.
+  fake.pages.push_back({{"in_5"}, false});
+  run_poll_receiving(ts.svc, job_of(kinds::kPollReceiving, {}), ss.get_token());
+  CHECK(ts.db.read([](db::Conn& c) { return db::kv_get(c, db::kv_keys::kPollGapWarning); }).has_value());
+  ts.clock.advance(repo::kPollGapShowMs + 1);
+  fake.pages.push_back({{"in_5"}, false});
+  run_poll_receiving(ts.svc, job_of(kinds::kPollReceiving, {}), ss.get_token());
+  CHECK_FALSE(ts.db.read([](db::Conn& c) { return db::kv_get(c, db::kv_keys::kPollGapWarning); }).has_value());
+}

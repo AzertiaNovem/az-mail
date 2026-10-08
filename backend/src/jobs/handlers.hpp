@@ -11,7 +11,9 @@
 //    short write, then rethrows, so no row is left 'queued'/'sending'/'pending' behind a dead job.
 //  * Long downloads/uploads (inbound attachments up to 50 MB) call jobs::extend_lease before each
 //    transfer; a false return means the lease was lost (another worker owns the job) → stop
-//    without side effects (throw Retry{}).
+//    without side effects (throw Retry{}). While a handler runs, the Runner also renews its lease
+//    periodically (RunnerConfig::heartbeat_every, RT-8), so a transfer longer than the lease
+//    keeps it.
 //  * Times come from svc.clock (svc.now_ms()), never azm::now_ms() directly.
 #pragma once
 
@@ -36,7 +38,8 @@ namespace azm::jobs {
 // ---- registration (called by app::App before Runner::start) --------------------------------
 // outbound.send, outbound.fetch_meta, outbound.reconcile (periodic cfg.reconcile_interval_sec).
 void register_outbound_jobs(Runner& runner);
-// inbound.fetch, poll.receiving (periodic cfg.poll_interval_sec).
+// inbound.fetch (+ abandon_inbound_fetch as its Runner::on_abandoned hook), poll.receiving
+// (periodic cfg.poll_interval_sec, exactly as configured — validation keeps it >= 5 s).
 void register_inbound_jobs(Runner& runner);
 // purge.trash, gc.blobs, gc.housekeeping, db.optimize (periodic, kinds.hpp intervals).
 void register_maintenance_jobs(Runner& runner);
@@ -79,11 +82,19 @@ std::chrono::milliseconds outbound_backoff(int attempts);
 // files left by a failure are removed before rethrowing. Last attempt → mark_inbound_failed
 // (common rules above), whatever the error.
 void run_inbound_fetch(Services& svc, const Job& job, std::stop_token st);
+// Additive (RT-2): before downloading, the attachment listing must cover every part that
+// get_received announced; otherwise Retry (the last attempt delivers what was listed).
 // poll.receiving (periodic / manual): list_received newest-first, walk pages until a known id
 // (mail::inbound_state) or 20 pages; record_inbound_pending + enqueue inbound.fetch (source
-// poll) per unknown id; kv last_poll_at / poll.high_water; warns (kv poll.gap_warning) when
-// ids older than the high-water mark were never seen (B7).
+// poll) per unknown id; kv last_poll_at / poll.high_water; warns (kv poll.gap_warning: the
+// Chinese detail text, kv updated_at = detection time → AdminStats.poll_gap) when ids older
+// than the high-water mark were never seen or the high-water mark was not found (B7); a warning
+// older than repo::kPollGapShowMs is deleted by the next poll.
 void run_poll_receiving(Services& svc, const Job& job, std::stop_token st);
+// Additive (RT-8): Runner::on_abandoned hook of inbound.fetch — lease recovery gave the job up
+// (lease expired on an attempt beyond max_attempts) → mail::mark_inbound_failed when the
+// inbound row is still pending, in recovery's transaction.
+void abandon_inbound_fetch(db::Tx& tx, const Job& job, int64_t now_ms);
 
 // Pure mapping of a fetched email + parsed raw headers + stored blobs to the domain input.
 // Header values win over Resend fields for Message-ID / In-Reply-To / References /
@@ -108,7 +119,8 @@ void run_purge_trash(Services& svc, const Job& job, std::stop_token st);
 void run_gc_blobs(Services& svc, const Job& job, std::stop_token st);
 // gc.housekeeping: repo::purge_expired_sessions, jobs::purge_finished (cfg.jobs_done_retention_days),
 // webhook_events older than cfg.webhook_events_retention_days, mail::purge_orphan_uploads
-// (cfg.unattached_upload_ttl_hours), jobs::recover_expired_leases; then (outside any tx) deletes
+// (cfg.unattached_upload_ttl_hours), lease recovery (svc.runner->recover_expired() so the
+// on_abandoned hooks run; the bare jobs::recover_expired_leases without a runner); then (outside any tx) deletes
 // regular files in svc.blobs.tmp_dir() (and secondary_blobs->tmp_dir() when different) whose
 // mtime is older than 24 h — staging .part files and temp downloads left by crashes.
 void run_gc_housekeeping(Services& svc, const Job& job, std::stop_token st);

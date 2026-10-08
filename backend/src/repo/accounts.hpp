@@ -429,12 +429,25 @@ struct StorageStats {  // AdminStats.storage (backend/delivery filled by the han
   int64_t blob_bytes = 0;
 };
 
+// How long a poller gap warning (kv poll.gap_warning) is shown in AdminStats.poll_gap (F4).
+inline constexpr int64_t kPollGapShowMs = 7LL * 24 * 3600 * 1000;
+
+struct PollGap {           // AdminStats.poll_gap (additive, F4)
+  int64_t detected_at = 0;  // kv poll.gap_warning updated_at (ms)
+  std::string detail;       // kv value (Chinese, no mail content)
+};
+
 struct AdminStats {  // API AdminStats
   int64_t users = 0;
   int64_t messages = 0;
   int64_t storage_bytes = 0;  // sum(blobs.size)
   int64_t queue_pending = 0;  // queue.pending (jobs pending + running)
   int64_t queue_dead = 0;     // queue.dead
+  // queue.periodic (additive, F4): those of queue_pending that are periodic jobs
+  // (dedupe "periodic:<kind>"), always queued — so UIs can show the real backlog apart.
+  int64_t queue_periodic = 0;
+  // poll_gap (additive, F4): the poller's gap warning while younger than kPollGapShowMs.
+  std::optional<PollGap> poll_gap;
   int64_t sent_24h = 0;       // outbound accepted in the last 24 h
   int64_t received_24h = 0;   // inbound_emails delivered in the last 24 h
   int64_t failed_24h = 0;     // outbound failed in the last 24 h
