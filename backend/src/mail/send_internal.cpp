@@ -349,7 +349,7 @@ int64_t cancel_to_draft(db::Tx& tx, int64_t owner, int64_t outbound_id, int64_t 
   const auto [message_id, thread_id] = *sender_copy;
 
   // A send job that is already running sees status 'canceled' in mark_sending and stops.
-  if (job_id) jobs::cancel(tx, *job_id);
+  if (job_id) jobs::cancel(tx, *job_id, now_ms);
   record_delivery_event(tx, outbound_id, "local.canceled", now_ms, {});
   delete_shared_copies(tx, outbound_id);           // their owners get threads.changed
   publish_outbound_change(tx, outbound_id, false);  // outbound.status 'canceled' to the sender

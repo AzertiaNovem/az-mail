@@ -404,7 +404,7 @@ bool mark_sending(db::Tx& tx, int64_t outbound_id) {
            "status IN ('queued','sending')",
            now, outbound_id);
     if (tx.changes() > 0) {
-      if (row->job_id) jobs::cancel(tx, *row->job_id);
+      if (row->job_id) jobs::cancel(tx, *row->job_id, now);
       json::object ev;
       ev["reason"] = "sender_copy_deleted";
       detail::record_delivery_event(tx, outbound_id, "local.canceled", now, ev);
@@ -711,7 +711,7 @@ ReschedulePlan begin_reschedule(db::Tx& tx, const Config& cfg, int64_t owner, in
     tx.run("UPDATE outbound SET scheduled_at = ?, updated_at = ? WHERE id = ? AND status = 'queued'", scheduled_at,
            now, s.row.id);
     if (tx.changes() == 0) throw invalid_state();
-    if (s.row.scheduled_via == ScheduledVia::Local && s.row.job_id) jobs::reschedule(tx, *s.row.job_id, scheduled_at);
+    if (s.row.scheduled_via == ScheduledVia::Local && s.row.job_id) jobs::reschedule(tx, *s.row.job_id, scheduled_at, now);
     json::object ev;
     ev["scheduled_at"] = scheduled_at;
     detail::record_delivery_event(tx, s.row.id, "local.rescheduled", now, ev);
@@ -746,7 +746,7 @@ void finish_reschedule(db::Tx& tx, int64_t owner, int64_t outbound_id, int64_t s
   json::object payload;
   payload[std::string(jobs::payload::kOutboundId)] = outbound_id;
   const int64_t job = jobs::enqueue(tx, jobs::kinds::kOutboundFetchMeta, std::move(payload), opts);
-  jobs::reschedule(tx, job, meta_at);
+  jobs::reschedule(tx, job, meta_at, now);
   detail::publish_outbound_change(tx, outbound_id, true);
 }
 
@@ -805,7 +805,7 @@ PendingSend cancel_pending_send(db::Tx& tx, int64_t owner, int64_t message_id, C
         detail::cancel_to_draft(tx, owner, row->id, now);  // back to a draft (then trashed by the caller)
       } else {
         // The copy is about to be deleted: nothing to restore, only the send to stop.
-        if (row->job_id) jobs::cancel(tx, *row->job_id);
+        if (row->job_id) jobs::cancel(tx, *row->job_id, now);
         json::object ev;
         ev["reason"] = "sender_copy_deleted";
         detail::record_delivery_event(tx, row->id, "local.canceled", now, ev);
