@@ -393,6 +393,43 @@ TEST_CASE("dates: Date header, received_at fallback, bogus future Date clamped",
   CHECK(fx.scalar_of("SELECT date FROM messages WHERE id = ?", c2.message_id) == now - 7000);
 }
 
+TEST_CASE("dates: a whole-second Date header is refined by a receipt inside that second", "[delivery][threading]") {
+  SendFx fx;
+  const int64_t t0 = (azm::now_ms() / 1000) * 1000 - 60'000;  // a whole second, a minute ago
+  auto stored_date = [&](std::string id, int64_t header, int64_t received) {
+    auto e = SendFx::inbound(std::move(id), kCustomer, {kBob}, {"bob@team.example"});
+    e.date = header;
+    e.received_at = received;
+    return fx.scalar_of("SELECT date FROM messages WHERE id = ?", copy_of(fx.deliver(e), fx.bob).message_id);
+  };
+  CHECK(stored_date("rcv-p1", t0, t0 + 280) == t0 + 280);    // same second: the precise receipt time
+  CHECK(stored_date("rcv-p2", t0, t0 + 1500) == t0);         // received a second later: the header
+  CHECK(stored_date("rcv-p3", t0, t0 - 300) == t0);          // sender clock slightly ahead: the header
+  CHECK(stored_date("rcv-p4", t0 + 123, t0 + 500) == t0 + 123);  // not a whole-second header: kept
+
+  // E2E 06/07: the reply is received 400 ms after alice's mail, in the same wall-clock second.
+  // With the truncated Date it sorted first, became the thread subject and was listed on top.
+  const SendResult s = fx.send(fx.simple_draft({kCustomer}, "报价单"));
+  fx.accept(s.outbound_id, "re_quote");
+  fx.ts.db.write([&](db::Tx& tx) {
+    set_outbound_message_id(tx, s.outbound_id, "quote@resend.dev");
+    tx.run("UPDATE messages SET date = ? WHERE id = ?", t0 + 500, s.message_id);
+    recompute_thread(tx, fx.alice, s.thread_id);
+  });
+  auto reply = SendFx::inbound("rcv-quote", kCustomer, {kAlice}, {"alice@team.example"}, "Re: 报价单", "rq@customer.example");
+  reply.in_reply_to = "quote@resend.dev";
+  reply.references = {"quote@resend.dev"};
+  reply.date = t0;
+  reply.received_at = t0 + 900;
+  REQUIRE(copy_of(fx.deliver(reply), fx.alice).thread_id == s.thread_id);
+  const auto detail = fx.thread(s.thread_id).value();
+  CHECK(detail.subject == "报价单");
+  REQUIRE(detail.messages.size() == 2);
+  CHECK(detail.messages[0].id == s.message_id);
+  CHECK(detail.messages[1].direction == Direction::In);
+  CHECK(detail.messages[1].date == t0 + 900);
+}
+
 TEST_CASE("inbound_emails state machine", "[delivery][state]") {
   SendFx fx;
   const int64_t id = fx.ts.db.write([&](db::Tx& tx) { return record_inbound_pending(tx, "rcv-s", InboundSource::Poll, 0); });

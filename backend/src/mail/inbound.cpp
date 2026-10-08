@@ -31,7 +31,23 @@ namespace {
 namespace json = boost::json;
 
 constexpr int64_t kDayMs = 24LL * 3600 * 1000;
+constexpr int64_t kSecondMs = 1000;
 constexpr std::size_t kMaxErrorBytes = 500;
+
+// messages.date of an inbound copy: the Date header, else Resend's receipt time, else now.
+//  * A Date more than a day after the receipt is bogus (sender clock) → the receipt time.
+//  * A Date header has whole-second precision while our own (out) copies carry milliseconds.
+//    When the ms receipt time falls inside the header's second it is the same instant, measured
+//    more precisely: use it. Otherwise a reply received within the second of the mail it
+//    answers sorts BEFORE it (by up to 999 ms), takes over the thread subject (the earliest
+//    message's) and is listed above its parent.
+int64_t message_date(int64_t header_date, int64_t received_at, int64_t now) {
+  int64_t date = header_date > 0 ? header_date : (received_at > 0 ? received_at : now);
+  if (received_at > 0 && date > received_at + kDayMs) date = received_at;  // bogus future Date
+  if (received_at > 0 && date % kSecondMs == 0 && received_at > date && received_at < date + kSecondMs)
+    date = received_at;
+  return date;
+}
 
 struct AddressHit {
   int64_t id = 0;
@@ -301,8 +317,7 @@ DeliveryResult deliver_inbound(db::Tx& tx, const InboundEmail& email, const Deli
   const std::string warnings_json = json::serialize(strings_json(warnings));
 
   const std::string subject = detail::clean_subject(email.subject);
-  int64_t date = email.date > 0 ? email.date : (email.received_at > 0 ? email.received_at : now);
-  if (email.received_at > 0 && date > email.received_at + kDayMs) date = email.received_at;  // bogus future Date
+  const int64_t date = message_date(email.date, email.received_at, now);
   const std::string snippet =
       email.text && !trim(*email.text).empty() ? make_snippet(*email.text, false) : make_snippet(email.html.value_or(""), true);
   std::vector<std::string> participants{normalize_email(email.from.email)};
