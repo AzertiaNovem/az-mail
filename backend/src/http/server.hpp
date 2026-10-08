@@ -55,6 +55,9 @@ class Server {
   // Closes the acceptor. Open connections finish their in-flight request and then close
   // (keep-alive is disabled once stopping). Idempotent; thread-safe.
   void stop();
+  // Additive (RT-5): closes every open connection now, busy ones included (end of the shutdown
+  // drain; WebSockets are closed by Hub::close_all). Implies stop(). Thread-safe.
+  void close_all();
 
   uint16_t port() const;           // actual bound port (valid after start())
   std::size_t connections() const;  // currently open connections

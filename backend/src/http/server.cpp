@@ -139,6 +139,11 @@ void Server::stop() {
   close_idle_connections(*st->shared);
 }
 
+void Server::close_all() {
+  stop();
+  close_all_connections(*impl_->st->shared);
+}
+
 uint16_t Server::port() const { return impl_->port.load(); }
 std::size_t Server::connections() const { return impl_->st->shared->connections.load(); }
 std::size_t Server::inflight() const { return impl_->st->shared->inflight.load(); }

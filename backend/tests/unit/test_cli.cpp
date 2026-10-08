@@ -11,6 +11,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <thread>
+
+#include <atomic>
+
 #include <fstream>
 #include <sstream>
 
@@ -39,12 +43,15 @@ CliResult cli(std::vector<std::string> args, const std::string& stdin_text = "")
 
 bool has(const std::string& s, std::string_view needle) { return s.find(needle) != std::string::npos; }
 
+// 64 hex characters, like `openssl rand -hex 32` (passes the AZMAIL_SECRET strength check).
+constexpr std::string_view kStrongSecret = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
 // An env file making `serve`/`doctor` validation pass, rooted in `dir`.
 std::string write_env(const test::TempDir& dir) {
   const auto path = dir / "azmail.env";
   std::ofstream f(path);
   f << "AZMAIL_DATA_DIR=" << (dir / "data").string() << "\n"
-    << "AZMAIL_SECRET=" << test::kTestSecret << "\n"
+    << "AZMAIL_SECRET=" << kStrongSecret << "\n"
     << "RESEND_API_KEY=re_test\n"
     << "AZMAIL_LOG_LEVEL=error\n";
   return path.string();
@@ -219,6 +226,42 @@ TEST_CASE("cli: backup uses the online backup API and verifies the copy", "[cli]
   CHECK_THROWS_AS(app::backup_database(db, db, true), std::runtime_error);
 }
 
+TEST_CASE("support: backup finishes while another connection keeps writing (RT-9)", "[cli][support]") {
+  test::TempDir td;
+  const std::string db = (td / "live.db").string();
+  REQUIRE(cli({"migrate", "--db-path", db}).code == 0);
+  db::Pool pool(db, 2);
+  // ~24 MB (≈ 6000 pages): a stepwise copy would need many steps, each restarted by a write.
+  pool.write([](db::Tx& tx) {
+    const std::string blob(4000, 'z');
+    for (int i = 0; i < 6000; ++i)
+      tx.run("INSERT INTO kv(key,value,updated_at) VALUES(?,?,1)", "fill" + std::to_string(i), blob);
+  });
+  std::atomic<bool> done{false};
+  std::atomic<int> writes{0};
+  std::thread writer([&] {
+    for (int i = 0; !done.load(); ++i) {
+      pool.write([&](db::Tx& tx) {
+        tx.run("INSERT OR REPLACE INTO kv(key,value,updated_at) VALUES('tick',?,?)", std::to_string(i), i);
+      });
+      ++writes;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  const auto t0 = std::chrono::steady_clock::now();
+  std::uint64_t size = 0;
+  CHECK_NOTHROW(size = app::backup_database(db, td / "copy.db", false));
+  const auto took = std::chrono::steady_clock::now() - t0;
+  done = true;
+  writer.join();
+  CHECK(took < std::chrono::seconds(60));
+  CHECK(writes.load() > 0);
+  CHECK(size > 20'000'000u);
+  db::Conn copy((td / "copy.db").string());
+  CHECK(copy.scalar<int64_t>("SELECT count(*) FROM kv WHERE key LIKE 'fill%'") == std::optional<int64_t>(6000));
+  CHECK(copy.scalar<std::string>("PRAGMA quick_check") == std::optional<std::string>("ok"));
+}
+
 TEST_CASE("cli: doctor --offline", "[cli]") {
   test::TempDir td;
   const auto env = write_env(td);
@@ -248,6 +291,15 @@ TEST_CASE("cli: doctor --offline", "[cli]") {
   r = cli({"--env-file", env, "--set", "AZMAIL_SECRET=short", "doctor", "--offline"});
   CHECK(r.code == 1);
   CHECK(has(r.out, "[FAIL] configuration: AZMAIL_SECRET is too short"));
+  // F2: the unedited placeholder of deploy/azmail.env.example is an error, not "[ OK ]".
+  r = cli({"--env-file", env, "--set", "AZMAIL_SECRET=CHANGE_ME_generate_with_openssl_rand_hex_32", "doctor",
+           "--offline"});
+  CHECK(r.code == 1);
+  CHECK(has(r.out, "[FAIL] configuration: AZMAIL_SECRET still holds the example placeholder"));
+  CHECK_FALSE(has(r.out, "[ OK ] configuration"));
+  r = cli({"--env-file", env, "--set", "RESEND_WEBHOOK_SECRET=whsec_xxxxxxxxxxxxxxxxxxxxxxxx", "doctor", "--offline"});
+  CHECK(r.code == 1);
+  CHECK(has(r.out, "[FAIL] configuration: RESEND_WEBHOOK_SECRET is not a real signing secret"));
 }
 
 TEST_CASE("support: r2_configured and sweep_tmp_dir", "[cli][support]") {

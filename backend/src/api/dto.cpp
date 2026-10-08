@@ -307,6 +307,7 @@ json::object to_json(const repo::AdminStats& s) {
   json::object queue;
   queue["pending"] = s.queue_pending;
   queue["dead"] = s.queue_dead;
+  queue["periodic"] = s.queue_periodic;  // additive (API.md Addendum B.1)
   json::object storage;
   storage["backend"] = s.storage.backend;
   storage["delivery"] = s.storage.delivery;
@@ -324,6 +325,14 @@ json::object to_json(const repo::AdminStats& s) {
   o["last_poll_at"] = opt(s.last_poll_at);
   o["quota_blocked"] = s.quota_blocked;
   o["storage"] = std::move(storage);
+  if (s.poll_gap) {  // additive (API.md Addendum B.1)
+    json::object gap;
+    gap["detected_at"] = s.poll_gap->detected_at;
+    gap["detail"] = s.poll_gap->detail;
+    o["poll_gap"] = std::move(gap);
+  } else {
+    o["poll_gap"] = nullptr;
+  }
   return o;
 }
 

@@ -45,8 +45,10 @@ namespace detail {
 // connection's strand (`ex`), except `ex` itself which is immutable after registration.
 struct ConnHandle {
   asio::any_io_executor ex;
-  beast::tcp_stream* stream = nullptr;  // valid while `idle` is true
-  bool idle = false;                    // waiting for the first byte of the next request
+  // The connection's stream; null once ownership moved to a WebSocket session or the session
+  // ended (strand-only, like `idle`).
+  beast::tcp_stream* stream = nullptr;
+  bool idle = false;  // waiting for the first byte of the next request
 };
 }  // namespace detail
 
@@ -437,7 +439,7 @@ struct Exchange {
 // Handles one request whose header has been read into `hp`.
 asio::awaitable<After> handle_request(beast::tcp_stream& stream, beast::flat_buffer& buf,
                                       bhttp::request_parser<bhttp::empty_body>& hp, SessionShared& shared,
-                                      const std::string& peer_ip) {
+                                      const std::string& peer_ip, detail::ConnHandle& handle) {
   Exchange x(stream, shared);
   const Config& cfg = shared.deps.cfg;
   auto& hreq = hp.get();
@@ -473,6 +475,7 @@ asio::awaitable<After> handle_request(beast::tcp_stream& stream, beast::flat_buf
         log::ScopedRequestId rid(x.req.request_id);
         log::debug("ws upgrade", {{"ip", x.req.remote_ip}});
       }
+      handle.stream = nullptr;  // moved below: close_all_connections must not touch it any more
       co_await ws::run_ws_session(std::move(stream), hp.release(), wsd);
       co_return After::Upgraded;
     }
@@ -504,8 +507,10 @@ asio::awaitable<After> handle_request(beast::tcp_stream& stream, beast::flat_buf
   if (auto cl = hp.content_length()) declared = *cl;
   if (auto r = precheck_body(route, declared)) co_return co_await x.respond(std::move(*r), body_pending);
 
-  // 5a. Uploads are authenticated before a single body byte is staged on disk.
-  if (route.body == BodyMode::File && (route.auth == AuthReq::User || route.auth == AuthReq::Admin)) {
+  // 5a. Authenticated routes check the Bearer token before a single body byte is read: uploads
+  // are never staged on disk and no JSON body (8 MiB for drafts) is buffered for anonymous
+  // clients (SEC-6). Bodiless requests skip this (dispatch authenticates them anyway).
+  if ((body_pending || route.body == BodyMode::File) && (route.auth == AuthReq::User || route.auth == AuthReq::Admin)) {
     std::optional<Principal> who;
     std::optional<Response> failure;
     if (auto token = bearer_token(x.req)) {
@@ -517,7 +522,7 @@ asio::awaitable<After> handle_request(beast::tcp_stream& stream, beast::flat_buf
         failure = Response::from_error(ApiError::unavailable());
       } catch (const std::exception& e) {
         log::ScopedRequestId rid(x.req.request_id);
-        log::error("upload pre-authentication failed", {{"error", e.what()}});
+        log::error("request pre-authentication failed", {{"error", e.what()}});
         failure = Response::from_error(ApiError::internal());
       }
     }
@@ -733,6 +738,26 @@ void close_idle_connections(SessionShared& shared) {
   }
 }
 
+void close_all_connections(SessionShared& shared) {
+  std::vector<std::shared_ptr<detail::ConnHandle>> live;
+  {
+    std::lock_guard lk(shared.conns_mu);
+    for (auto& [id, w] : shared.conns)
+      if (auto h = w.lock()) live.push_back(std::move(h));
+  }
+  for (auto& h : live) {
+    std::weak_ptr<detail::ConnHandle> weak = h;
+    asio::post(h->ex, [weak] {
+      auto c = weak.lock();
+      if (c && c->stream) {
+        beast::error_code ec;
+        c->stream->socket().shutdown(tcp::socket::shutdown_both, ec);
+        c->stream->close();  // closes the socket and cancels its timer
+      }
+    });
+  }
+}
+
 asio::awaitable<void> run_session(tcp::socket socket, SessionShared& shared) {
   shared.connections.fetch_add(1);
   struct ConnCount {
@@ -817,7 +842,7 @@ asio::awaitable<void> run_session(tcp::socket socket, SessionShared& shared) {
         break;
       }
 
-      after = co_await handle_request(stream, buf, hp, shared, peer_ip);
+      after = co_await handle_request(stream, buf, hp, shared, peer_ip, *handle);
       if (after != After::KeepAlive) break;
     }
 

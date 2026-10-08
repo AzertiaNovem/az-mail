@@ -6,11 +6,13 @@
 //  3. OPTIONS → http::preflight inline (no pool);
 //  4. Router::match → 404 "not_found" / 405 "method_not_allowed" (+ Allow);
 //  5. Content-Length over Route::body_limit → 413 "payload_too_large" before reading the body;
-//     5a. BodyMode::File routes with AuthReq::User/Admin: BEFORE reading the body,
+//     5a. Routes with AuthReq::User/Admin and a request body still to read (BodyMode::File
+//         uploads, and — SEC-6 — Json/Raw/None bodies too): BEFORE reading the body,
 //         co_await run_blocking(db_pool, http::authenticate(bearer_token)) — missing/invalid
 //         → 401 "unauthorized" (Admin without is_admin → 403 "forbidden") without reading the
 //         body, sent with Connection: close (the unread body makes the stream unusable). So
-//         anonymous clients can never stage bytes on disk;
+//         anonymous clients can never stage bytes on disk nor make the server buffer an 8 MiB
+//         draft body; dispatch authenticates again (cheap, and sees revocations meanwhile);
 //     then move-construct request_parser<string_body | file_body> and read in an
 //     async_read_some loop re-arming cfg.body_idle_timeout_sec per chunk (BodyMode::File streams
 //     to make_staging_path(BlobStore::tmp_dir()) with a running sha256);
@@ -90,6 +92,12 @@ boost::asio::awaitable<void> run_session(boost::asio::ip::tcp::socket socket, Se
 // in the middle of a request finish it and then close (keep-alive is off once `stopping`).
 // Thread-safe.
 void close_idle_connections(SessionShared& shared);
+
+// Additive (RT-5): closes the socket of EVERY open HTTP connection, busy ones included — the end
+// of the shutdown drain. Pending reads/writes fail at once; a request whose handler is still on
+// a blocking pool finds its socket closed when it resumes. Upgraded (WebSocket) connections are
+// left to Hub::close_all. Thread-safe.
+void close_all_connections(SessionShared& shared);
 
 // ---- pure helpers (unit-tested by WP-A) -----------------------------------------------------
 

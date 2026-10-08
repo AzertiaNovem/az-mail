@@ -415,3 +415,40 @@ TEST_CASE("r2: probe reports reachability, bucket, write and presign checks", "[
   CHECK_FALSE(rep.ok());
   CHECK_FALSE(rep.detail.empty());
 }
+
+TEST_CASE("r2: objects over 64 KiB dedupe and exist over real HTTP (RT-1)", "[r2][http_client]") {
+  test::TempDir td;
+  const sigv4::Credentials creds{"e2e-key", "e2e-secret"};
+  test::FakeS3 s3{"big-bucket", creds, system_clock()};
+  // Like real S3/R2 (and the mock): HEAD of an object reports its size in Content-Length.
+  test::FakeHttpServer srv([&](const test::FakeRequest& req) {
+    const auto r = s3.handle(req.method, req.path, req.query, req.headers, req.body);
+    test::FakeResponse out;
+    out.status = r.status;
+    out.headers = r.headers;
+    out.body = r.body;
+    if (req.method == "HEAD" && r.status == 200) {
+      const std::string prefix = "/big-bucket/";
+      if (auto obj = s3.object(req.path.substr(prefix.size()))) out.body = *obj;  // header only on the wire
+    }
+    return out;
+  });
+  net::ClientOptions co;
+  co.allow_insecure_http = true;
+  net::HttpClient http(co);
+  R2Options o = options(td);
+  o.endpoint = srv.base_url();
+  o.bucket = "big-bucket";
+  o.creds = creds;
+  auto store = make_r2_blob_store(o, http);
+
+  const std::string big(100 * 1024, 'b');
+  const auto ref = store->put_bytes(big);
+  CHECK(store->exists(ref.sha256));
+  CHECK(store->put_bytes(big).sha256 == ref.sha256);  // HEAD-before-PUT dedupe of an existing object
+  CHECK(s3.count("PUT") == 1);
+  const auto staged = make_staging_path(store->tmp_dir());
+  write_file(staged, big);
+  CHECK(store->put_file(staged, ref.sha256).sha256 == ref.sha256);
+  CHECK_FALSE(store->exists(std::string(64, 'e')));
+}

@@ -108,7 +108,18 @@ void run_gc_housekeeping(Services& svc, const Job&, std::stop_token) {
     return mail::purge_orphan_uploads(tx, now - static_cast<int64_t>(cfg.unattached_upload_ttl_hours) * kHourMs,
                                       kOrphanUploadBatch);
   });
-  step("leases", [&](db::Tx& tx) { return recover_expired_leases(tx, now); });
+  if (svc.runner != nullptr) {
+    // Through the Runner so on_abandoned hooks record the domain failure of given-up jobs (RT-8).
+    try {
+      const int n = svc.runner->recover_expired();
+      if (n > 0) log::info("housekeeping", {{"step", "leases"}, {"rows", n}});
+    } catch (const std::exception& e) {
+      log::error("housekeeping step failed", {{"step", "leases"}, {"error", e.what()}});
+      if (!first_error) first_error = std::current_exception();
+    }
+  } else {
+    step("leases", [&](db::Tx& tx) { return recover_expired_leases(tx, now); });
+  }
 
   // Staging leftovers of crashed uploads/downloads (outside any transaction).
   std::set<fs::path> dirs{svc.blobs.tmp_dir()};

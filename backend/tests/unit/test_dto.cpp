@@ -287,9 +287,15 @@ TEST_CASE("dto: AdminStats", "[dto]") {
   s.quota_blocked = true;
   s.storage = {"r2", "proxy", 12, 1024};
   check_json(api::to_json(s), R"({"users":2,"messages":30,"storage_bytes":1024,
-    "queue":{"pending":3,"dead":1},"sent_24h":4,"received_24h":5,"failed_24h":6,
+    "queue":{"pending":3,"dead":1,"periodic":0},"sent_24h":4,"received_24h":5,"failed_24h":6,
     "last_webhook_at":null,"last_poll_at":77,"quota_blocked":true,
-    "storage":{"backend":"r2","delivery":"proxy","blob_count":12,"blob_bytes":1024}})");
+    "storage":{"backend":"r2","delivery":"proxy","blob_count":12,"blob_bytes":1024},"poll_gap":null})");
+  // Additive (API.md Addendum B.1): periodic jobs apart from the backlog, the poller's gap warning.
+  s.queue_periodic = 2;
+  s.poll_gap = repo::PollGap{1234, "发现 3 封早于上次同步位置但从未收到的邮件"};
+  const auto o = api::to_json(s);
+  CHECK(o.at("queue").at("periodic") == 2);
+  CHECK(o.at("poll_gap") == json::parse(R"({"detected_at":1234,"detail":"发现 3 封早于上次同步位置但从未收到的邮件"})"));
 }
 
 // ---- parsers ---------------------------------------------------------------------------------

@@ -29,7 +29,9 @@
 #include <boost/asio/thread_pool.hpp>
 
 #include <algorithm>
+#include <condition_variable>
 #include <csignal>
+#include <cstdlib>
 #include <future>
 #include <mutex>
 #include <stdexcept>
@@ -40,6 +42,18 @@ namespace azm::app {
 namespace asio = boost::asio;
 namespace fs = std::filesystem;
 
+ShutdownBudget shutdown_budget(int shutdown_grace_sec) {
+  using std::chrono::milliseconds;
+  using std::chrono::seconds;
+  ShutdownBudget b;
+  b.total = seconds(std::max(shutdown_grace_sec, 1));
+  b.drain = std::min<milliseconds>(seconds(5), b.total / 4);
+  // Reserve after the HTTP abort for handlers to record their outcome and the pools to finish.
+  b.after_abort = std::clamp<milliseconds>(b.total / 5, milliseconds(500), seconds(5));
+  b.abort_at = b.total - b.after_abort;
+  return b;
+}
+
 struct App::Impl {
   Config cfg;
 
@@ -47,6 +61,7 @@ struct App::Impl {
   // object outlives its users (HttpClient outlives the R2 store and the Resend client, Services
   // outlives the Runner, the io_context dies before the pools and everything it references).
   std::unique_ptr<db::Pool> pool;
+  std::shared_ptr<net::CancelSignal> http_cancel;  // aborts outbound HTTP at shutdown (RT-7)
   std::unique_ptr<net::HttpClient> http;
   std::unique_ptr<BlobStore> local_store;
   std::unique_ptr<BlobStore> r2_store;
@@ -105,7 +120,12 @@ void App::Impl::build() {
   }
 
   // ---- 2. outbound HTTP ---------------------------------------------------------------------------
-  http = std::make_unique<net::HttpClient>(net::client_options_from(cfg));
+  {
+    auto opts = net::client_options_from(cfg);
+    http_cancel = std::make_shared<net::CancelSignal>();
+    opts.cancel = http_cancel;
+    http = std::make_unique<net::HttpClient>(std::move(opts));
+  }
 
   // ---- 3. R2 probe (may switch this App's delivery mode to proxy) ---------------------------------
   const bool use_r2 = r2_configured(cfg);
@@ -159,7 +179,13 @@ void App::Impl::build() {
   svc->files_workers = files_workers.get();
 
   // ---- 6. jobs + routes -------------------------------------------------------------------------------
-  runner = std::make_unique<jobs::Runner>(*pool, *svc, jobs::runner_config_from(cfg));
+  {
+    auto rc = jobs::runner_config_from(cfg);
+    // shutdown() gives handlers the job grace itself (wait_idle) and aborts their HTTP; the
+    // Runner's own stop() then only waits for them to record the outcome.
+    rc.stop_grace = shutdown_budget(cfg.shutdown_grace_sec).after_abort / 4;
+    runner = std::make_unique<jobs::Runner>(*pool, *svc, rc);
+  }
   jobs::register_outbound_jobs(*runner);
   jobs::register_inbound_jobs(*runner);
   jobs::register_maintenance_jobs(*runner);
@@ -210,36 +236,70 @@ void App::Impl::build() {
 
 void App::Impl::shutdown() noexcept {
   try {
-    // 1. Stop accepting; idle keep-alive connections close, busy ones finish their request.
-    if (server) server->stop();
-    // 2. WebSockets get 1001 going_away.
-    if (hub) hub->close_all();
-    // 3. Let in-flight requests and WS close handshakes finish (bounded).
-    if (server && ioc && !io_threads.empty()) {
-      const auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::seconds(std::clamp(cfg.shutdown_grace_sec, 1, 10));
-      while (server->connections() > 0 && std::chrono::steady_clock::now() < deadline)
+    using Steady = std::chrono::steady_clock;
+    const auto t0 = Steady::now();
+    const ShutdownBudget budget = shutdown_budget(cfg.shutdown_grace_sec);
+    auto left_until = [&](std::chrono::milliseconds at) {
+      return std::max(std::chrono::duration_cast<std::chrono::milliseconds>(t0 + at - Steady::now()),
+                      std::chrono::milliseconds(0));
+    };
+    auto wait_connections = [&](std::chrono::milliseconds at) {
+      while (server->connections() > 0 && Steady::now() < t0 + at)
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
-      if (server->connections() > 0)
+    };
+    // 1. Stop accepting (idle keep-alive connections close, busy ones finish their request),
+    //    WebSockets get 1001 going_away, job handlers see their stop token and no new job starts.
+    if (server) server->stop();
+    if (hub) hub->close_all();
+    if (runner) runner->request_stop();
+    // 2. Drain in-flight requests and WS close handshakes (≤ budget.drain), then close what is
+    //    left — busy connections included (RT-5).
+    if (server && ioc && !io_threads.empty()) {
+      wait_connections(budget.drain);
+      if (server->connections() > 0) {
         log::warn("shutdown: closing remaining connections", {{"count", server->connections()}});
+        server->close_all();
+        wait_connections(budget.drain + std::chrono::seconds(1));
+      }
     }
-    // 4. Jobs (≤ cfg.shutdown_grace_sec; running jobs keep their lease and are recovered later).
-    if (runner) runner->stop();
-    // 5. Blocking pools: wait for queued handler work (their completions go to the io_context).
-    if (db_workers) db_workers->join();
-    if (net_workers) net_workers->join();
-    if (files_workers) files_workers->join();
-    if (pool) pool->set_hooks({});
-    // 6. io_context.
+    // 3. Job handlers get the rest of the job grace; then every outbound HTTP transfer still in
+    //    flight (jobs and the net/files pools) is aborted — NetError Aborted, which jobs record as
+    //    a retry that does not consume an attempt — so the steps below are short (RT-7).
+    if (runner && !runner->wait_idle(left_until(budget.abort_at)))
+      log::warn("shutdown: job handlers still running; aborting their network transfers");
+    if (http_cancel) http_cancel->cancel();
+    if (runner) {
+      (void)runner->wait_idle(left_until(budget.total - budget.after_abort / 2));
+      runner->stop();
+    }
+    // 4. io_context first: once its threads are gone no connection can hand new work to a pool.
     work.reset();
     if (ioc) ioc->stop();
     for (auto& t : io_threads)
       if (t.joinable()) t.join();
     io_threads.clear();
-    // Destroy the server and then the io_context (remaining coroutine frames) while every object
-    // they reference is still alive.
+    // 5. Blocking pools: run what is queued (completions are queued on the stopped io_context),
+    //    then DESTROY them while the io_context still exists: an operation orphaned in a pool owns
+    //    coroutine frames whose executors and sockets belong to the io_context (RT-5).
+    if (db_workers) db_workers->join();
+    if (net_workers) net_workers->join();
+    if (files_workers) files_workers->join();
+    if (pool) pool->set_hooks({});
+    if (svc) {
+      svc->db_workers = nullptr;
+      svc->net_workers = nullptr;
+      svc->files_workers = nullptr;
+    }
+    files_workers.reset();
+    net_workers.reset();
+    db_workers.reset();
+    // 6. The server, then the io_context (remaining coroutine frames) while every object they
+    //    reference is still alive.
     server.reset();
     ioc.reset();
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(Steady::now() - t0);
+    if (took > budget.total)
+      log::warn("shutdown took longer than AZMAIL_SHUTDOWN_GRACE_SEC", {{"ms", static_cast<int64_t>(took.count())}});
   } catch (const std::exception& e) {
     log::error("error during shutdown", {{"error", e.what()}});
   }
@@ -283,7 +343,26 @@ int App::run() {
   });
   const int code = finished.get();
   signals.reset();
+  // Hard bound of the whole shutdown (F6/RT-7): its phases fit in AZMAIL_SHUTDOWN_GRACE_SEC, but
+  // a handler stuck outside any abortable transfer (or a wedged pool) would otherwise wait for
+  // systemd's SIGKILL. Leases make abandoning running jobs safe.
+  std::mutex wd_mu;
+  std::condition_variable wd_cv;
+  bool wd_done = false;
+  std::thread watchdog([&, limit = shutdown_budget(impl_->cfg.shutdown_grace_sec).total] {
+    std::unique_lock lk(wd_mu);
+    if (wd_cv.wait_for(lk, limit, [&] { return wd_done; })) return;
+    log::error("shutdown exceeded AZMAIL_SHUTDOWN_GRACE_SEC; exiting without waiting further",
+               {{"limit_ms", static_cast<int64_t>(limit.count())}});
+    std::_Exit(1);
+  });
   stop();
+  {
+    std::lock_guard lk(wd_mu);
+    wd_done = true;
+  }
+  wd_cv.notify_all();
+  watchdog.join();
   return code;
 }
 

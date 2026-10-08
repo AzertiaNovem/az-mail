@@ -15,6 +15,7 @@
 #include "resend/rate_limiter.hpp"
 #include "resend/types.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -32,6 +33,12 @@ class HttpClient;
 }
 
 namespace azm::resend {
+
+// Additive (RT-4): overall deadline of POST /emails for a `body_bytes` JSON body — `base`
+// (RESEND_TIMEOUT_SEC) plus the upload time at `bytes_per_sec` (RESEND_UPLOAD_KBPS), capped at
+// max(base, 15 min). The per-chunk idle limit stays RESEND_TIMEOUT_SEC.
+std::chrono::milliseconds send_timeout(std::chrono::milliseconds base, std::size_t body_bytes,
+                                       std::uint64_t bytes_per_sec);
 
 class Client {
  public:
@@ -55,7 +62,8 @@ class Client {
   // GET /emails/receiving?limit=&after=&before= (Priority::Low). limit 1–100.
   virtual ReceivedPage list_received(int limit, std::optional<std::string> after,
                                      std::optional<std::string> before);
-  // GET /emails/receiving/{id}/attachments (Priority::Normal): fresh download URLs.
+  // GET /emails/receiving/{id}/attachments (Priority::Normal): fresh download URLs. Every page
+  // (limit=100, after=<last id> while has_more, ≤ 20 pages) concatenated.
   virtual std::vector<RecvAttachment> list_received_attachments(std::string_view id);
   // Downloads a Resend-provided URL to `dest` WITHOUT the Authorization header (redirects
   // followed; not rate-limited). Throws Error(Validation, name "too_large") over max_bytes.

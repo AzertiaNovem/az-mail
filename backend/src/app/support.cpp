@@ -86,13 +86,18 @@ std::uint64_t backup_database(const fs::path& src, const fs::path& dest, bool ov
     sqlite3_backup* b = sqlite3_backup_init(d.db, "main", s.db, "main");
     if (b == nullptr) sqlite_fail(d.db, "cannot start backup");
     int rc = SQLITE_OK;
-    // Small steps so concurrent writers of the live database are never blocked for long; a
-    // write by another connection restarts the copy automatically (SQLite semantics).
+    // ONE step copying every page (-1), RT-9: SQLite restarts an online backup from page 1
+    // whenever another connection writes the source between two steps, so a stepwise copy of a
+    // large database written every few seconds by the server may never finish. The live
+    // database is in WAL mode, where this step holds only a read snapshot: the server keeps
+    // writing (into the WAL) while it runs, and the copy is that consistent snapshot.
+    // BUSY/LOCKED (a checkpoint or recovery in progress) is retried for a bounded time.
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::minutes(2);
     while (true) {
-      rc = sqlite3_backup_step(b, 512);
+      rc = sqlite3_backup_step(b, -1);
       if (rc == SQLITE_DONE) break;
-      if (rc == SQLITE_OK) continue;
-      if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
+      if ((rc == SQLITE_BUSY || rc == SQLITE_LOCKED || rc == SQLITE_OK) &&
+          std::chrono::steady_clock::now() < give_up) {
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
         continue;
       }

@@ -7,7 +7,9 @@
 #include "core/address.hpp"
 #include "core/crypto.hpp"
 #include "core/errors.hpp"
+#include "core/strings.hpp"
 #include "db/sqlite.hpp"
+#include "http/throttle.hpp"
 #include "repo/accounts.hpp"
 #include "services.hpp"
 
@@ -18,6 +20,7 @@ namespace json = boost::json;
 namespace {
 
 constexpr int64_t kDayMs = 24LL * 3600 * 1000;
+constexpr std::size_t kMaxEmailBytes = 254;  // RFC 5321 path limit; longer cannot be an account
 
 [[noreturn]] void too_many_attempts(int retry_after) {
   json::object d;
@@ -52,11 +55,17 @@ http::Response auth_login(http::Ctx& ctx) {
   const std::string email = normalize_email(in.email);
   const std::string& ip = ctx.req.remote_ip;
   http::LoginThrottle* throttle = svc.login_throttle;
+  // Something that cannot be an account address is never looked up nor tracked per email (an
+  // attacker-sized string must not live in the throttle, SEC-2); it still costs a dummy scrypt
+  // and counts against the client IP.
+  const bool plausible = email.size() <= kMaxEmailBytes && is_valid_email(email);
+  const std::string_view throttle_email = plausible ? std::string_view(email) : std::string_view();
 
   if (throttle != nullptr)
-    if (auto retry_after = throttle->check(email, ip)) too_many_attempts(*retry_after);
+    if (auto retry_after = throttle->check(throttle_email, ip)) too_many_attempts(*retry_after);
 
-  const auto user = svc.db.read([&](db::Conn& c) { return repo::find_user_by_email(c, email); });
+  const auto user = plausible ? svc.db.read([&](db::Conn& c) { return repo::find_user_by_email(c, email); })
+                              : std::optional<repo::User>();
   bool ok = false;
   {
     detail::ScryptSlot slot(svc);
@@ -64,19 +73,24 @@ http::Response auth_login(http::Ctx& ctx) {
     ok = crypto::password_verify(in.password, user ? user->password_hash : detail::dummy_password_hash());
   }
   const int64_t now = svc.now_ms();
-  if (!user || !ok) {
-    if (throttle != nullptr) throttle->record_failure(email, ip);
+  // A disabled account answers the same whatever the password (SEC-7): the 403 must not confirm
+  // a correct guess, and every attempt counts against the throttle like a wrong password.
+  if (user && user->disabled) {
+    if (throttle != nullptr) throttle->record_failure(throttle_email, ip);
     svc.db.write([&](db::Tx& tx) {
-      repo::audit(tx, user ? std::optional<int64_t>(user->id) : std::nullopt, "login.failure", email,
-                  {{"reason", user ? "bad_password" : "unknown_email"}}, ip, now);
-    });
-    throw ApiError::unauthorized("invalid_credentials", "邮箱或密码错误");
-  }
-  if (user->disabled) {
-    svc.db.write([&](db::Tx& tx) {
-      repo::audit(tx, user->id, "login.failure", email, {{"reason", "disabled"}}, ip, now);
+      repo::audit(tx, user->id, "login.failure", email, {{"reason", ok ? "disabled" : "disabled_bad_password"}},
+                  ip, now);
     });
     throw ApiError::forbidden("account_disabled", "该账号已被停用，请联系管理员");
+  }
+  if (!user || !ok) {
+    if (throttle != nullptr) throttle->record_failure(throttle_email, ip);
+    svc.db.write([&](db::Tx& tx) {
+      repo::audit(tx, user ? std::optional<int64_t>(user->id) : std::nullopt, "login.failure",
+                  utf8_truncate(email, kMaxEmailBytes),
+                  {{"reason", user ? "bad_password" : plausible ? "unknown_email" : "invalid_email"}}, ip, now);
+    });
+    throw ApiError::unauthorized("invalid_credentials", "邮箱或密码错误");
   }
   if (throttle != nullptr) throttle->record_success(email, ip);
 

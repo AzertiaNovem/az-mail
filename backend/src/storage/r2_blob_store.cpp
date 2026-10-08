@@ -160,7 +160,8 @@ class S3Client {
       try {
         return fn();
       } catch (const BlobError& e) {
-        if (!e.retryable || i >= attempts) throw;
+        // After a shutdown abort (RT-7) every attempt would fail at once: no backoff sleeps.
+        if (!e.retryable || i >= attempts || http_.cancelled()) throw;
         log::debug("R2 retry", {{"attempt", i}, {"error", e.what()}});
         std::this_thread::sleep_for(opts_.retry_base_delay * (1 << std::min(i - 1, 10)));
       }

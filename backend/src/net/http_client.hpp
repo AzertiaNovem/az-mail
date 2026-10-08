@@ -17,6 +17,8 @@
 //    is set and the final status is 2xx, streamed to that file (≤ max_body) with sha256 + size
 //    computed while writing. Non-2xx responses always go to `body` (truncated to 64 KiB) so
 //    callers can parse error documents; the sink file is then not created.
+//  * Shutdown (additive, RT-7): ClientOptions::cancel shares a CancelSignal; cancel() aborts every
+//    send() in flight within milliseconds (NetError{Kind::Aborted}) and fails later sends fast.
 // Thread-safe: concurrent send() calls are independent.
 #pragma once
 
@@ -40,12 +42,35 @@ struct Config;
 
 namespace azm::net {
 
+// ---- additive (RT-7): process shutdown --------------------------------------------------------
+// Abort switch shared by the HttpClients whose ClientOptions::cancel points to it (App: one per
+// process, fired once the job grace period of a graceful shutdown is over). cancel() stops every
+// send() in flight — it throws NetError{Kind::Aborted} within milliseconds, whatever the request
+// deadline, DNS lookups included — and every later send() fails the same way before connecting.
+// Irreversible. Thread-safe.
+class CancelSignal {
+ public:
+  CancelSignal();
+  ~CancelSignal();
+  CancelSignal(const CancelSignal&) = delete;
+  CancelSignal& operator=(const CancelSignal&) = delete;
+
+  void cancel() noexcept;
+  bool cancelled() const noexcept;
+
+ private:
+  friend class HttpClient;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 struct ClientOptions {
   std::string user_agent = "azmail";       // cfg.resend_user_agent (Cloudflare 1010 without it)
   std::string ca_file;                     // cfg.ca_file; empty = system default trust store
   bool allow_insecure_http = false;        // cfg.allow_insecure_http (AZMAIL_ALLOW_INSECURE_HTTP=1)
   std::chrono::milliseconds connect_timeout{10000};  // DNS + TCP + TLS handshake
   std::chrono::milliseconds read_timeout{30000};     // idle limit per read/write (re-armed per chunk)
+  std::shared_ptr<CancelSignal> cancel;              // additive (RT-7): shutdown abort; null = never
 };
 
 // Options derived from Config (user agent, CA file, insecure flag, cfg.resend_timeout_sec as
@@ -62,6 +87,10 @@ struct HttpRequest {
   int max_redirects = 0;                              // 0 = return 3xx responses as-is
   std::optional<std::filesystem::path> sink;          // write a 2xx response body to this file
   std::size_t max_body = 50u << 20;                   // response body limit (memory or sink)
+  // Additive (RT-4): wait for the response header once the request is written, instead of
+  // ClientOptions::read_timeout (still capped by `timeout`). For large uploads: the last
+  // write completes into the kernel's send buffer, which then drains at the link's pace.
+  std::optional<std::chrono::milliseconds> response_timeout;
 };
 
 struct HttpResponse {
@@ -86,12 +115,14 @@ struct NetError : std::runtime_error {
     TooLarge,        // response body over max_body
     InsecureScheme,  // http:// without allow_insecure_http, or unsupported scheme
     Io,              // local file error (body_file / sink)
+    Aborted,         // additive (RT-7): ClientOptions::cancel fired (process shutdown)
   };
   NetError(Kind k, const std::string& what) : std::runtime_error(what), kind(k) {}
   Kind kind;
-  // Transient conditions worth retrying (Timeout, Connect, Protocol).
+  // Transient conditions worth retrying (Timeout, Connect, Protocol; Aborted: later, by a job
+  // after the restart — never in a loop within this process).
   bool retryable() const {
-    return kind == Kind::Timeout || kind == Kind::Connect || kind == Kind::Protocol;
+    return kind == Kind::Timeout || kind == Kind::Connect || kind == Kind::Protocol || kind == Kind::Aborted;
   }
 };
 
@@ -108,6 +139,8 @@ class HttpClient {
   virtual HttpResponse send(const HttpRequest&);
 
   const ClientOptions& options() const;
+  // Additive (RT-7): true once options().cancel fired (in-process retry loops stop retrying).
+  bool cancelled() const;
 
  protected:
   HttpClient();  // for test doubles that override send()

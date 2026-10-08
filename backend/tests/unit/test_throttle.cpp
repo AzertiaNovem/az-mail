@@ -153,3 +153,69 @@ TEST_CASE("throttle: scrypt semaphore bounds concurrency", "[throttle]") {
   auto e = t.acquire_scrypt();  // would block forever if a permit leaked
   SUCCEED();
 }
+
+// ---- SEC-2: bounded memory whatever clients send -------------------------------------------
+
+TEST_CASE("throttle: attacker-sized emails are keyed by a fixed-size digest", "[throttle][sec]") {
+  ManualClock clock(0);
+  http::LoginThrottle t(limits(), clock);
+  const std::string huge(1u << 20, 'a');  // 1 MiB "email"
+  for (int i = 0; i < 5; ++i) t.record_failure(huge + "@x.cn", "10.0.0.1");
+  CHECK(t.email_keys() == 1);
+  // Still the same key (case-insensitive, trimmed) and still throttled per email.
+  CHECK(t.check(" " + huge + "@X.cn", "10.9.9.9"));
+  t.record_success(huge + "@x.cn", "10.0.0.1");
+  CHECK(t.email_keys() == 0);
+}
+
+TEST_CASE("throttle: an empty email counts against the IP only", "[throttle][sec]") {
+  ManualClock clock(0);
+  http::LoginThrottle t(limits(5, 3), clock);
+  for (int i = 0; i < 3; ++i) t.record_failure("", "198.51.100.7");
+  CHECK(t.email_keys() == 0);
+  CHECK(t.ip_keys() == 1);
+  CHECK(t.check("", "198.51.100.7") == std::optional<int>(900));
+  CHECK(t.check("someone@x.cn", "198.51.100.7"));  // the IP is blocked for every account
+  CHECK_FALSE(t.check("", "198.51.100.8"));
+}
+
+TEST_CASE("throttle: IPv6 clients are counted per /64", "[throttle][sec]") {
+  using LT = http::LoginThrottle;
+  CHECK(LT::ip_key("203.0.113.9") == "203.0.113.9");
+  CHECK(LT::ip_key("::ffff:203.0.113.9") == "203.0.113.9");
+  CHECK(LT::ip_key("2001:db8:1:2:aaaa:bbbb:cccc:dddd") == "2001:db8:1:2::/64");
+  CHECK(LT::ip_key("[2001:db8:1:2::1]") == "2001:db8:1:2::/64");
+  CHECK(LT::ip_key("not-an-ip") == "not-an-ip");
+  CHECK(LT::ip_key(std::string(500, 'z')).size() == 64);
+
+  ManualClock clock(0);
+  LT t(limits(5, 20), clock);
+  // A new address of the same /64 for every attempt: still one IP window.
+  for (int i = 0; i < 20; ++i) {
+    const std::string ip = "2001:db8:1:2::" + std::to_string(i + 1);
+    REQUIRE_FALSE(t.check("u" + std::to_string(i) + "@x.cn", ip));
+    t.record_failure("u" + std::to_string(i) + "@x.cn", ip);
+  }
+  CHECK(t.check("fresh@x.cn", "2001:db8:1:2:ffff::9"));
+  CHECK_FALSE(t.check("fresh@x.cn", "2001:db8:1:3::1"));  // another /64
+  CHECK(t.ip_keys() == 1);
+}
+
+TEST_CASE("throttle: each map keeps at most kMaxKeys entries", "[throttle][sec]") {
+  ManualClock clock(0);
+  http::LoginThrottle t(limits(), clock);
+  const std::size_t n = http::LoginThrottle::kMaxKeys + 500;
+  for (std::size_t i = 0; i < n; ++i) {
+    t.record_failure("spray" + std::to_string(i) + "@x.cn", "10." + std::to_string((i >> 16) & 255) + "." +
+                                                                std::to_string((i >> 8) & 255) + "." +
+                                                                std::to_string(i & 255));
+    clock.advance(1);  // all inside the window: pruning alone frees nothing
+  }
+  CHECK(t.email_keys() <= http::LoginThrottle::kMaxKeys);
+  CHECK(t.ip_keys() <= http::LoginThrottle::kMaxKeys);
+  // The newest entries survive the eviction (the stalest go first): the newest email keeps its
+  // failure and reaches the limit with four more.
+  const std::string newest = "spray" + std::to_string(n - 1) + "@x.cn";
+  for (int i = 0; i < 4; ++i) t.record_failure(newest, "192.0.2.1");
+  CHECK(t.check(newest, "192.0.2.2"));
+}

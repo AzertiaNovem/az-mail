@@ -7,6 +7,8 @@
 #include "api/handlers.hpp"
 #include "config.hpp"
 
+#include <algorithm>
+
 namespace azm::api {
 
 namespace {
@@ -27,9 +29,12 @@ RouteLimits route_limits_from(const Config& cfg) {
 
 std::vector<http::Route> route_table(const RouteLimits& L) {
   const std::size_t J = L.json, D = L.draft, U = L.upload, W = L.webhook, N = L.bodyless;
+  // Anonymous login bodies are tiny (email ≤ 254 + password ≤ 256 bytes, even JSON-escaped):
+  // 8 KiB instead of the 1 MiB JSON limit (SEC-2).
+  const std::size_t LOGIN = std::min<std::size_t>(J, 8u << 10);
   return {
       // ---- auth / settings ---------------------------------------------------------------
-      {V::post, "/api/auth/login", AuthReq::None, BodyMode::Json, J, Exec::Db, auth_login},
+      {V::post, "/api/auth/login", AuthReq::None, BodyMode::Json, LOGIN, Exec::Db, auth_login},
       {V::post, "/api/auth/logout", AuthReq::User, BodyMode::None, N, Exec::Db, auth_logout},
       {V::get, "/api/auth/me", AuthReq::User, BodyMode::None, 0, Exec::Db, auth_me},
       {V::post, "/api/auth/password", AuthReq::User, BodyMode::Json, J, Exec::Db, auth_change_password},

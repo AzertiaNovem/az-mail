@@ -19,7 +19,11 @@
 //    re-claimed changes nothing.
 //  * Leases: running jobs whose locked_until passed go back to 'pending' at start() and every
 //    RunnerConfig::recover_every (crash recovery). Handlers with long transfers extend their
-//    lease with extend_lease().
+//    lease with extend_lease(); additionally (RT-8) the Runner renews the lease of every job its
+//    workers are executing each RunnerConfig::heartbeat_every (for at most max_heartbeat), so a
+//    live handler keeps its claim however long a transfer takes, and only a dead/stalled process
+//    lets it expire. A job given up by recovery (lease expired on an attempt beyond
+//    max_attempts) runs its kind's on_abandoned hook in the same transaction.
 //  * Periodic kinds (Runner::on with `periodic`): start() seeds one pending job (dedupe
 //    "periodic:<kind>") if none exists; whenever a periodic job ENDS — done or dead (Permanent,
 //    or attempts exhausted) — its successor (now + interval) is enqueued inside the SAME
@@ -68,10 +72,13 @@ struct EnqueueOpts {
 int64_t enqueue(db::Tx&, std::string_view kind, boost::json::object payload, EnqueueOpts = {});
 
 // pending → canceled. False when the job is not pending (running/done/dead/missing).
-bool cancel(db::Tx&, int64_t job_id);
+// `now_ms` (additive): updated_at; 0 → azm::now_ms(). Callers with a Clock pass it (like
+// EnqueueOpts::now_ms), so jobs touched under a ManualClock stay consistent with it.
+bool cancel(db::Tx&, int64_t job_id, int64_t now_ms = 0);
 
 // Moves a pending job's run_at (and wakes the runner). False when not pending.
-bool reschedule(db::Tx&, int64_t job_id, int64_t run_at_ms);
+// `now_ms` (additive): updated_at; 0 → azm::now_ms().
+bool reschedule(db::Tx&, int64_t job_id, int64_t run_at_ms, int64_t now_ms = 0);
 
 // ---- additive helpers ---------------------------------------------------------------------
 // dead | canceled → pending with attempts=0, run_at=now, last_error kept (admin "retry").
@@ -125,6 +132,11 @@ struct Job {
 };
 
 using JobFn = std::function<void(Services&, const Job&, std::stop_token)>;
+// Additive (RT-8): runs inside lease recovery's write transaction for a job of the hook's kind
+// that recovery just set 'dead' ("lease expired repeatedly") — the handler never saw that
+// attempt fail, so its last-attempt bookkeeping (e.g. mark_inbound_failed) happens here.
+// `job.attempts` is the attempt that expired. Throwing rolls the whole recovery back.
+using AbandonFn = std::function<void(db::Tx&, const Job&, int64_t now_ms)>;
 
 struct RunnerConfig {
   // Worker threads per lane; lanes with 0 threads are not run (e.g. tests driving run_one()).
@@ -134,9 +146,14 @@ struct RunnerConfig {
   std::chrono::milliseconds idle_poll{std::chrono::seconds(1)};  // max sleep without a wake()
   std::chrono::milliseconds recover_every{std::chrono::minutes(1)};
   std::chrono::milliseconds stop_grace{std::chrono::seconds(25)};  // stop() waits this long for handlers
+  // Additive (RT-8): lease renewal of running handlers (locked_until = now + lease), at most for
+  // max_heartbeat after the claim; 0 disables. Default lease/4.
+  std::chrono::milliseconds heartbeat_every{std::chrono::seconds(75)};
+  std::chrono::milliseconds max_heartbeat{std::chrono::hours(2)};
 };
 
-// From cfg.jobs_*_threads and cfg.shutdown_grace_sec.
+// From cfg.jobs_*_threads and cfg.shutdown_grace_sec; lease 2 min with a heartbeat every 30 s
+// (additive, RT-7/RT-8: live handlers keep their claim, a crashed one is retried soon).
 RunnerConfig runner_config_from(const Config& cfg);
 
 class Runner {
@@ -151,11 +168,22 @@ class Runner {
   // a lane that differs from kinds::lane_for(kind).
   void on(std::string kind, std::string lane, JobFn,
           std::optional<std::chrono::seconds> periodic = {});
+  // Additive (RT-8): hook for jobs of `kind` given up by lease recovery (before start()).
+  // Throws std::invalid_argument for an unknown or unregistered kind or a second hook.
+  void on_abandoned(std::string kind, AbandonFn);
   // Recovers expired leases, seeds periodic jobs and starts the lane threads.
   void start();
   // Requests stop (handlers see their stop_token), waits up to stop_grace, then joins.
   // Jobs still running keep their lease and are recovered at the next start. Idempotent.
   void stop();
+  // Additive (RT-7): the first half of stop() without waiting — handlers see their stop_token,
+  // idle workers exit, no new job is claimed. Idempotent; stop() must still be called.
+  void request_stop();
+  // Additive (RT-7): waits up to `timeout` for every worker thread to exit (true = all exited).
+  bool wait_idle(std::chrono::milliseconds timeout);
+  // Additive (RT-8): one lease-recovery pass now (with on_abandoned hooks); the number of jobs
+  // recovered. Used by gc.housekeeping instead of the bare recover_expired_leases.
+  int recover_expired();
   // Wakes idle workers (Pool TxHooks::wake_jobs). Thread-safe, cheap, callable anytime.
   void wake();
 
