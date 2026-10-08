@@ -206,3 +206,6 @@ interface AdminStats {
 
 ### Authenticated routes with a body (behaviour)
 - Every `U`/`A` route with a request body checks the Bearer token **before** reading the body: 401 `unauthorized` (403 `forbidden` for non-admins on `A` routes) with `Connection: close`, whatever the body size. The 413 `payload_too_large` check on `Content-Length` still comes first.
+
+### Addendum B.2 — thread list preview for sent mail (be_mail)
+`ThreadListItem.to_preview?: {name:string, email:string, is_me:boolean}[]` — up to 3 To/Cc recipients (never Bcc) of the owner's newest non-draft outgoing message in the view; omitted when none. The frontend shows "收件人：…" for Sent/Scheduled rows. Also: thread actions `trash` / `delete_forever` may return 409 `scheduled_send_pending` (Resend holds a scheduled send — cancel it first) or 409 `send_in_progress`; admin/user outbox retry of an already superseded or deleted row returns 409 `invalid_state`; retries return 403 `send_as_forbidden` when the sender lost send-as rights. New outbound `error_name` values: `payload_corrupt`, `attachment_missing`, `sender_not_allowed`; new delivery event types: `local.superseded`, `local.canceled` (reason `sender_copy_deleted`).

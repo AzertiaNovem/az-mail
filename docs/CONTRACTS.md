@@ -590,3 +590,16 @@ Additive notes for drafts, outbound and inbound where DESIGN/headers left room.
     creates the row (source `webhook`); `error` is truncated to 500 bytes.
 14. **WP0 stub tests** (see §I 11): "WP0 fixer stubs link" also asserts `mail::queue_send` throws
     `NotImplemented` (lines 697–698), which no longer holds; WP0 must drop those assertions too.
+
+
+## I. Decisions made during the review-fix round (merged)
+- **Signature**: the server never appends the settings signature; the frontend editor inserts `div[data-azm-signature]` exactly once above the quote.
+- **Frozen send payload**: `payload_json` has a `"wire"` object (In-Reply-To/References) computed once before the first POST; all strings are valid UTF-8; retries under one Idempotency-Key send identical bytes. A user/admin retry creates a new outbound uuid and re-resolves headers.
+- **Pending sends vs delete**: trash cancels only queued *scheduled* sends; delete-forever cancels any queued send; Resend-held scheduled sends or sends being POSTed → 409 `scheduled_send_pending` / `send_in_progress`.
+- **Raw .eml GC**: an inbound raw blob is referenced only while its inbound row is pending/failed or a message still has that `inbound_id`. `attachment_count` counts normal (non-draft, non-trashed, non-spam) messages only. Spam purge ages by `MAX(date, created_at, updated_at)`.
+- **Loopback trust**: X-AzMail-Ref only clears `spoofed_internal` when all local envelope recipients were on that send; the outbound Message-ID is captured from inbound mail only when the ref check and DKIM/DMARC pass. Reconcile is round-robin (kv `outbound.reconcile_cursor`); a poll event repeating an already recorded type is a Duplicate.
+- **Login/auth**: disabled account → 403 `account_disabled` regardless of password (counted by the throttle); invalid/huge email → 401; login body limit 8 KiB; authenticated routes check the Bearer token before reading any body; throttle keys emails by sha256, caps maps at 100k entries, IPv6 per /64.
+- **Shutdown**: `AZMAIL_SHUTDOWN_GRACE_SEC` (default 25) is the TOTAL graceful shutdown time (drain 5 s, jobs until 20 s, then in-flight HTTP transfers aborted via `net::CancelSignal`); hard `exit(1)` on overrun; `TimeoutStopSec=40` must stay ≥ grace + 10 s. Job lease 2 min with 30 s heartbeat; `Runner::on_abandoned` hook marks abandoned inbound fetches failed.
+- **Resend upload deadline**: `RESEND_TIMEOUT_SEC + body / RESEND_UPLOAD_KBPS` (default 256 KiB/s), capped at 15 min.
+- **Secrets**: `AZMAIL_SECRET` must be ≥32 bytes, contain no placeholder marker (CHANGE_ME…), and not be degenerate; `RESEND_WEBHOOK_SECRET` must be `whsec_` + base64 of ≥16 bytes. `doctor` reports violations.
+- **Known gaps (not fixed)**: marking a thread containing a queued scheduled send as Spam leaves the send queued; disabling a user or revoking send-as does not cancel their already-queued sends; `repo::list_outbox(status=failed)` still lists superseded rows; signed-URL `exp` has no upper bound check; the Material Symbols font (~4 MB) is not subset.
