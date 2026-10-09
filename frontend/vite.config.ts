@@ -26,24 +26,11 @@ export default defineConfig({
     sourcemap: true,
     // The self-hosted Material Symbols font is ~4 MB; keep it a separate file, never inlined.
     assetsInlineLimit: 4096,
-    rolldownOptions: {
-      output: {
-        codeSplitting: {
-          // The rich-text editor (TipTap / ProseMirror) is only used by the lazily loaded compose
-          // window and the settings signature editor: one named, cacheable chunk that the
-          // initial (inbox) load never fetches.
-          groups: [
-            {
-              name: 'editor',
-              // Only the editor packages themselves: their shared dependencies (react…) stay in
-              // the entry, otherwise the entry would import this chunk.
-              includeDependenciesRecursively: false,
-              test: /[\\/]node_modules[\\/](?:@tiptap[\\/]|prosemirror-|orderedmap[\\/]|rope-sequence[\\/]|w3c-keyname[\\/]|linkifyjs[\\/])/,
-            },
-          ],
-        },
-      },
-    },
+    // No manual chunk groups: forcing the TipTap packages into a named chunk made Rolldown emit
+    // a circular import between that chunk and a lazy page chunk (LinkDialog <-> editor), which
+    // crashes at startup ("Cannot read properties of undefined (reading 'extend')"). Natural
+    // dynamic-import splitting already keeps the editor out of the initial load (compose, settings
+    // and admin are React.lazy). `pnpm check:chunks` fails the build on any chunk import cycle.
   },
   test: {
     environment: 'jsdom',

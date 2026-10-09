@@ -49,6 +49,8 @@ jobs:
       - run: pnpm lint
       - run: pnpm test
       - run: pnpm build
+      - name: 检查构建产物没有 chunk 循环引用（会导致页面加载时报 "Cannot read properties of undefined"）
+        run: pnpm check:chunks
 
       - name: 检查 config.js 里的后端地址
         run: |
