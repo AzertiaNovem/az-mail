@@ -1,0 +1,2 @@
+import{A as e,Ot as t,gt as n,ht as r}from"./common-CSEIB2Go.js";function i(){return t({queryKey:r.me(),queryFn:({signal:t})=>e(t),staleTime:n.me})}export{i as t};
+//# sourceMappingURL=useMe-B8N6ZprY.js.map
