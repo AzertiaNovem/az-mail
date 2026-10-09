@@ -360,3 +360,30 @@ python3 tools/resend_probe.py --domain probe.example.com --yes --sending-key re_
 * 端到端测试：`python3 tests/e2e/run.py`（随机端口启动模拟服务器和后端，默认使用模拟 R2，结束后再用本地存储跑一组冒烟测试）。
 * 模拟服务器自检：`python3 -m tools.mock_resend.selftest`。
 * 部署文件检查：`AZMAIL_BIN=backend/build/mac-debug/azmail python3 tests/e2e/test_deploy.py`（Nginx 代理头与日志、配置示例的占位符、systemd 停机超时、前端部署脚本；用真实二进制确认未修改的配置示例无法通过校验）。
+
+## 用 GitHub Actions + Cloudflare Pages 发布前端
+
+前端是纯静态文件，可以放在 Cloudflare Pages。构建和测试由 GitHub Actions 完成，Cloudflare Pages 只负责发布：
+
+```
+git push main ──► GitHub Actions（.github/workflows/frontend-pages.yml）
+                    lint → 测试 → 构建 → 生成 _headers
+                    └─（仅 main）把 dist 作为一个新提交强制推送到 cf-pages 分支
+                                        └─► Cloudflare Pages 监听 cf-pages，自动发布
+```
+
+**后端地址**写在 `frontend/public/config.js` 的 `apiBase`（必须是 `https://` 开头，例如 `https://mail-api.example.com`），随构建一起发布；工作流会检查它，写错会直接失败。修改地址就是改这个文件并推送。后端的 `AZMAIL_CORS_ORIGINS` 要包含 Pages 的域名（`https://<项目>.pages.dev` 和你绑定的自定义域名）。
+
+**一次性设置（Cloudflare 控制台）**：
+
+1. Workers & Pages → 创建 → Pages → 连接到 Git，授权并选择仓库 `az-mail`。
+2. 生产分支选 **`cf-pages`**（工作流第一次在 main 上跑完后才会出现这个分支，先推送一次 main 再来配置）。
+3. 框架预设选「无」；**构建命令留空**；**输出目录填 `/`**（产物已经在分支根目录）。
+4. 保存并部署。以后每次 main 上的前端改动，Actions 构建完成后会更新 `cf-pages`，Pages 自动发布。
+5. 可选：在 Pages 项目里绑定自定义域名。
+
+**注意**：
+- 只有 `frontend/**` 的改动才会触发；PR 只跑检查，不发布。
+- `cf-pages` 分支只放构建产物，每次覆盖成一个新提交，不要手动改它。
+- 响应头（CSP、缓存策略）由工作流生成的 `_headers` 提供，`connect-src` 取自 `apiBase`；不存在的路径会自动回退到 `index.html`（Pages 默认行为）。
+- 预览域名（`*.pages.dev` 的分支预览）不在后端 CORS 白名单里，需要的话自己加。

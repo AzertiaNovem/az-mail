@@ -262,7 +262,9 @@ std::optional<std::string> scrypt_raw(std::string_view pw, std::string_view salt
   const uint64_t N = uint64_t{1} << ln;
   // Memory needed by OpenSSL: 128*r*(N + p + 2) bytes, plus slack.
   const uint64_t need = 128ull * static_cast<uint64_t>(r) * (N + static_cast<uint64_t>(p) + 2);
-  const uint64_t maxmem = std::max(kMinMaxmem, need + (1ull << 20));
+  // Both operands must be uint64_t: on Linux LP64 uint64_t is `unsigned long`, so a `1ull`
+  // literal here would deduce conflicting types for std::max (GCC/libstdc++ hard error).
+  const uint64_t maxmem = std::max(kMinMaxmem, need + (uint64_t{1} << 20));
   std::string out(key_len, '\0');
   if (EVP_PBE_scrypt(pw.data(), pw.size(), reinterpret_cast<const unsigned char*>(salt.data()),
                      salt.size(), N, static_cast<uint64_t>(r), static_cast<uint64_t>(p), maxmem,

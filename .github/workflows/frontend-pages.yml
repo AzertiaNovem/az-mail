@@ -1,0 +1,116 @@
+# 前端：GitHub Actions 负责测试和构建，Cloudflare Pages 负责发布。
+#
+# 流程：推送到 main（或 PR）→ 本工作流 lint / 测试 / 构建 →（仅 main）把构建产物作为一个全新提交
+# 强制推送到 `cf-pages` 分支 → Cloudflare Pages 监听 `cf-pages` 分支，每次提交自动发布。
+# Pages 项目不需要构建命令（产物已经构建好）。设置见 docs/DEPLOY.md「用 GitHub Actions + Cloudflare Pages 发布前端」。
+#
+# 后端地址不在这里配置：它写在 frontend/public/config.js 里（apiBase），随构建一起发布。
+name: frontend-pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-pages.yml"
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-pages.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: frontend-pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4 # 版本取自 frontend/package.json 的 packageManager
+        with:
+          package_json_file: frontend/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22" # package.json engines: >=22.22.0
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build
+
+      - name: 检查 config.js 里的后端地址
+        run: |
+          set -eu
+          cat dist/config.js
+          api_base="$(sed -n 's/^window\.__AZMAIL_CONFIG__.*apiBase:[[:space:]]*"\([^"]*\)".*/\1/p' dist/config.js | head -n1)"
+          case "$api_base" in
+            https://*) echo "API base: $api_base" ;;
+            *) echo "::error file=frontend/public/config.js::apiBase 必须是 https:// 开头的后端地址（现在是 '$api_base'）；Pages 站点与后端不同源"; exit 1 ;;
+          esac
+          echo "API_BASE=$api_base" >> "$GITHUB_ENV"
+
+      - name: 生成 Cloudflare Pages 的 _headers（CSP 的 connect-src 取自 apiBase）
+        run: |
+          set -eu
+          host="${API_BASE#https://}"; host="${host%%/*}"
+          cat > dist/_headers <<HEADERS
+          /*
+            Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https://${host} wss://${host}; font-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+            X-Content-Type-Options: nosniff
+            Referrer-Policy: no-referrer
+            Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()
+          /index.html
+            Cache-Control: no-store
+          /config.js
+            Cache-Control: no-store
+          /assets/*
+            Cache-Control: public, max-age=31536000, immutable
+          HEADERS
+          cat dist/_headers
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    # 只有 main 上的推送才发布；PR 只跑上面的检查。
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # 推送 cf-pages 分支
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+
+      - name: 把构建产物提交到 cf-pages 分支（强制覆盖，只保留一个提交）
+        env:
+          SRC_SHA: ${{ github.sha }}
+          REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+        run: |
+          set -eu
+          cd dist
+          git init -q -b cf-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Deploy frontend from ${SRC_SHA}"
+          git push --force "$REPO_URL" cf-pages
